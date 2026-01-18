@@ -47,7 +47,7 @@ class VideoDataset(Dataset):
     def __init__(
         self,
         video_dir: str,
-        sequence_length: int = 200,
+        sequence_length: int = 384,
         frame_size: tuple[int, int] = (224, 224),
     ):
         self.video_dir = Path(video_dir)

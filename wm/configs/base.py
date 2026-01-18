@@ -85,6 +85,9 @@ class TokenizerConfig(BaseConfig):
     mask_ratio_min: float = 0.0
     mask_ratio_max: float = 0.9
 
+    # Memory optimization
+    gradient_checkpointing: bool = True
+
 
 # =============================================================================
 # Training Config (reusable across models)

@@ -1,6 +1,7 @@
 import torch
 
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from einops.layers.torch import Rearrange
 
 from wm.models.transformer.block import TransformerBlock, SpaceAttention
@@ -25,9 +26,11 @@ class CausalTokenizer(nn.Module):
         num_heads=8,
         num_latents=128,
         latent_dim=128,
+        gradient_checkpointing=False,
     ):
         super().__init__()
 
+        self.gradient_checkpointing = gradient_checkpointing
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
@@ -77,6 +80,18 @@ class CausalTokenizer(nn.Module):
             nn.Linear(embed_dim, self.patch_dim),
             Rearrange("b t (h w) (p1 p2 c) -> b t c (h p1) (w p2)", h=int(img_size / patch_size), p1=patch_size, p2=patch_size)
         )
+
+    def _run_block(self, block, x, attn_mask=None):
+        """Run a transformer block with optional gradient checkpointing."""
+        if self.gradient_checkpointing and self.training:
+            return checkpoint(
+                block,
+                x,
+                attn_mask,
+                # use_reentrant=False,
+            )
+        else:
+            return block(x, attn_mask=attn_mask)
 
     def random_masking(self, patches):
         """
@@ -196,9 +211,9 @@ class CausalTokenizer(nn.Module):
         encoded = encoder_input
         for block in self.encoder_blocks:
             if isinstance(block.attention, SpaceAttention):
-                encoded = block(encoded, attn_mask=attn_mask)
+                encoded = self._run_block(block, encoded, attn_mask)
             else:
-                encoded = block(encoded)
+                encoded = self._run_block(block, encoded)
 
         # Extract latent tokens only (first num_latents tokens)
         latent_encoded = encoded[:, :, :self.num_latents, :]
@@ -235,9 +250,9 @@ class CausalTokenizer(nn.Module):
         decoded = decoder_input
         for block in self.decoder_blocks:
             if isinstance(block.attention, SpaceAttention):
-                decoded = block(decoded, attn_mask=attn_mask)
+                decoded = self._run_block(block, decoded, attn_mask)
             else:
-                decoded = block(decoded)
+                decoded = self._run_block(block, decoded)
 
         # Extract patch reconstructions (last N tokens)
         patch_decoded = decoded[:, :, self.num_latents:, :]

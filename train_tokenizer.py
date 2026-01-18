@@ -155,11 +155,14 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
 
     torch.manual_seed(config.seed + rank)
 
-    model = CausalTokenizer().to(device)
+    model = CausalTokenizer(
+        gradient_checkpointing=config.tokenizer.gradient_checkpointing,
+    ).to(device)
 
     if is_main:
         num_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {num_params:,} ({num_params/1e6:.1f}M)")
+        print(f"Gradient checkpointing: {config.tokenizer.gradient_checkpointing}")
 
     if use_fsdp:
         model = apply_fsdp(
