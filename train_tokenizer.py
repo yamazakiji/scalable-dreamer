@@ -265,10 +265,6 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
                 metrics["step"] = step
                 metrics["epoch"] = epoch
 
-                if use_fsdp and FSDP_AVAILABLE:
-                    mem_stats = get_memory_stats(local_rank)
-                    metrics.update({f"memory/{k}": v for k, v in mem_stats.items()})
-
                 print(
                     f"Step {step}/{config.training.max_steps} | "
                     f"Loss: {metrics['loss']:.4f} | "
