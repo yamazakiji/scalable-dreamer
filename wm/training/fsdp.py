@@ -11,7 +11,6 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
     StateDictOptions,
 )
-from torch.utils.checkpoint import checkpoint
 
 
 def get_mixed_precision_policy(dtype: str = "bf16") -> MixedPrecisionPolicy | None:
