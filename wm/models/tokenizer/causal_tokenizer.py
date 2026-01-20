@@ -83,7 +83,7 @@ class CausalTokenizer(nn.Module):
 
     def _run_block(self, block, x, attn_mask=None):
         """Run a transformer block with optional gradient checkpointing."""
-        if self.gradient_checkpointing and self.training:
+        if self.gradient_checkpointing:
             return checkpoint(
                 block,
                 x,
