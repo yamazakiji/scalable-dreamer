@@ -79,7 +79,7 @@ def evaluate(
     """Evaluation phase for CausalTokenizer."""
     model.eval()
 
-    batch = next(iter(eval_dataloader))
+    batch, _ = next(iter(eval_dataloader))
     batch = batch.to(device)
 
     all_metrics = {}
@@ -252,7 +252,7 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
-        for batch in dataloader:
+        for batch, _ in dataloader:
             batch = batch.to(device)
 
             metrics = train_step(

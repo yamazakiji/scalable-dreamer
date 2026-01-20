@@ -70,11 +70,13 @@ Following the paper:
 - [x] Random policy for rollout collection
 - [x] Rollout collection script (stable-retro integration)
 - [x] Tokenizer training script works
+- [x] Train decent tokenizer
 
 ### TODO
 
-- [ ] Train decent tokenizer
-- [ ] Dynamics model training script
+- [ ] Refactor dataset class from simple Video to Video with metadata (needed for dynamics model training)
+- [ ] Dynamics model training script (Simple flow matching)
+- [ ] Dynamics model training script (Shortcut forcing)
 - [ ] Agent model (policy/reward/value heads)
 - [ ] Agent finetuning phase
 - [ ] Imagination training / RL
