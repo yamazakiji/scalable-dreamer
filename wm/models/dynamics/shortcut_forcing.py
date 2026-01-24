@@ -160,7 +160,7 @@ class ShortcutForcing(nn.Module):
         # This requires two forward passes with half step size
         if not is_finest.all():
             bootstrap_loss = self._compute_bootstrap_loss(
-                model, z_clean, z_corrupted, z_noise, actions, tau, d, weight
+                model, z_pred, z_corrupted, actions, tau, d, weight
             )
         else:
             bootstrap_loss = torch.zeros_like(flow_loss)
@@ -178,9 +178,8 @@ class ShortcutForcing(nn.Module):
     def _compute_bootstrap_loss(
         self,
         model: nn.Module,
-        z_clean: Tensor,
+        z_pred: Tensor,
         z_corrupted: Tensor,
-        z_noise: Tensor,
         actions: Tensor,
         tau: Tensor,
         d: Tensor,
@@ -196,14 +195,22 @@ class ShortcutForcing(nn.Module):
         v_target = (b' + b'') / 2  (stopped gradient)
 
         Then loss is computed in x-space with (1-τ)² scaling.
+
+        Args:
+            model: Dynamics model
+            z_pred: (B, T, N, D) prediction from full step (already computed)
+            z_corrupted: (B, T, N, D) corrupted representations
+            actions: (B, T) action indices
+            tau: (B, T) signal levels
+            d: (B, T) step sizes
+            weight: Loss weight
         """
-        B, T, N, D = z_clean.shape
-        device = z_clean.device
+        B, T, N, D = z_pred.shape
+        device = z_pred.device
 
         # Half step size
         d_half = d / 2  # (B, T)
         tau_expanded = tau.unsqueeze(-1).unsqueeze(-1)
-        d_expanded = d.unsqueeze(-1).unsqueeze(-1)
         d_half_expanded = d_half.unsqueeze(-1).unsqueeze(-1)
 
         # First half step: predict clean from current corrupted
@@ -225,11 +232,8 @@ class ShortcutForcing(nn.Module):
             # Target velocity is average of two steps
             v_target = (v_pred_1 + v_pred_2) / 2
 
-        # Full step prediction
-        z_pred_full = model(z_corrupted, actions, tau, d)
-
-        # Convert prediction to v-space for loss
-        v_pred_full = (z_pred_full - z_corrupted) / (1 - tau_expanded + 1e-8)
+        # Convert prediction to v-space for loss (reuse z_pred passed in)
+        v_pred_full = (z_pred - z_corrupted) / (1 - tau_expanded + 1e-8)
 
         # Bootstrap loss in v-space, scaled back to x-space
         # L = (1-τ)² ||v̂ - v_target||²

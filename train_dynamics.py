@@ -29,6 +29,8 @@ from wm.utils.metrics import compute_latent_metrics
 from wm.utils.evaluation import prepare_eval_batch, aggregate_metrics, log_evaluation
 from wm.utils.io import save_frame_outputs, save_evaluation_summary
 
+torch.autograd.set_detect_anomaly(True)
+
 # FSDP imports (optional, only used when --fsdp is enabled)
 try:
     from wm.training.fsdp import (

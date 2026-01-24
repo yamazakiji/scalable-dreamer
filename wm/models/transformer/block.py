@@ -35,18 +35,18 @@ class RoPE(nn.Module):
     def forward(self, q, k):
         """
         Apply rotary embeddings to queries and keys
-        q, k: (batch, seq_len, num_heads, head_dim)
+        q, k: (batch, num_heads, seq_len, head_dim)
         """
         seq_len = q.shape[2]
-        
-        # Get cached cos/sin for current sequence length
-        cos = self.cos_cached[:seq_len, :]
-        sin = self.sin_cached[:seq_len, :]
-        
+
+        # Clone to avoid view aliasing issues with gradient computation
+        cos = self.cos_cached[:seq_len, :].clone()
+        sin = self.sin_cached[:seq_len, :].clone()
+
         # Apply rotation: x * cos + rotate_half(x) * sin
         q_embed = q * cos + self.rotate_half(q) * sin
         k_embed = k * cos + self.rotate_half(k) * sin
-        
+
         return q_embed, k_embed
     
 
