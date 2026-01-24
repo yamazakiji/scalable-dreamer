@@ -1,6 +1,7 @@
-"""Evaluation metrics for image reconstruction."""
+"""Evaluation metrics for image reconstruction and latent space."""
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     import lpips
@@ -92,3 +93,43 @@ def compute_reconstruction_metrics(
         metrics['lpips'] = lpips_score.item()
 
     return metrics
+
+
+def compute_latent_metrics(z_pred: torch.Tensor, z_target: torch.Tensor) -> dict:
+    """
+    Compute detailed metrics between predicted and target latents.
+
+    Args:
+        z_pred: (B, N, D) or (B, 1, N, D) predicted latent
+        z_target: (B, N, D) or (B, 1, N, D) target latent
+
+    Returns:
+        Dictionary with keys: mse, cosine_sim, per_token_mse, relative_error
+    """
+    # Ensure consistent shape
+    if z_pred.dim() == 4:
+        z_pred = z_pred.squeeze(1)
+    if z_target.dim() == 4:
+        z_target = z_target.squeeze(1)
+
+    # MSE
+    mse = F.mse_loss(z_pred, z_target).item()
+
+    # Cosine similarity (flatten spatial dims)
+    z_pred_flat = z_pred.flatten(start_dim=1)  # (B, N*D)
+    z_target_flat = z_target.flatten(start_dim=1)  # (B, N*D)
+    cos_sim = F.cosine_similarity(z_pred_flat, z_target_flat, dim=-1).mean().item()
+
+    # Per-token MSE: average across batch and latent dim, keep spatial
+    per_token_mse = ((z_pred - z_target) ** 2).mean(dim=(0, 2))  # (N,)
+
+    # Relative error (RMSE normalized by target magnitude)
+    target_magnitude = (z_target ** 2).mean().item()
+    rel_error = (mse / (target_magnitude + 1e-8)) ** 0.5
+
+    return {
+        "mse": mse,
+        "cosine_sim": cos_sim,
+        "per_token_mse": per_token_mse.tolist(),
+        "relative_error": rel_error,
+    }
