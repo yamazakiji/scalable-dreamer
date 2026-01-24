@@ -71,12 +71,12 @@ Following the paper:
 - [x] Rollout collection script (stable-retro integration)
 - [x] Tokenizer training script works
 - [x] Train decent tokenizer
+- [x] Refactor dataset class from simple Video to Video with metadata (needed for dynamics model training)
+- [x] Dynamics model training script (Shortcut forcing)
 
 ### TODO
 
-- [ ] Refactor dataset class from simple Video to Video with metadata (needed for dynamics model training)
-- [ ] Dynamics model training script (Simple flow matching)
-- [ ] Dynamics model training script (Shortcut forcing)
+- [ ] Train decent dynamics model
 - [ ] Agent model (policy/reward/value heads)
 - [ ] Agent finetuning phase
 - [ ] Imagination training / RL
@@ -143,6 +143,12 @@ python train_tokenizer.py --no-wandb
 # Resume from checkpoint
 python train_tokenizer.py --resume outputs/my_experiment/checkpoint_step_10000.pt
 ```
+
+## Links for weights
+
+Tokenizer for MK2
+
+[Click](https://drive.google.com/file/d/11eO3shbxodYv4z_12GRAs3eTx4dpIdC3/view?usp=sharing)
 
 ## Project Structure
 
