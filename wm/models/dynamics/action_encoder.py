@@ -52,6 +52,10 @@ class ActionEncoder(nn.Module):
             # Unlabeled video: return only learned embedding
             B, T = actions.shape if actions is not None else (1, 1)
             return self.learned_token.expand(B, T, -1, -1)
+        
+        if len(actions.shape) > 2:
+            # assume its one hot encoded actions
+            actions = actions.argmax(dim=-1) # (B, T)
 
         B, T = actions.shape
 
