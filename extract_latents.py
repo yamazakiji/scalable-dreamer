@@ -126,10 +126,10 @@ def process_dataset(
         # Extract latents
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                latents, _, _, _ = model(frames, apply_masking=False)  # TODO: somehow doesnt work with tokenize
+                latents, _, _, _ = model(frames, apply_masking=False)  # Note: FSDP does not work with methods other than forward
 
         # Create and save transitions
-        transitions = create_transitions(latents, actions)
+        transitions = create_transitions(latents.squeeze(0).cpu().to(torch.float32), actions.squeeze(0))  # note: needed as later these latents will be used for training
         save_transitions(output_dir, idx, transitions)
 
         num_episodes += 1
