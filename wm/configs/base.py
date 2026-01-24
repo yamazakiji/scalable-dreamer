@@ -89,6 +89,33 @@ class TokenizerConfig(BaseConfig):
     gradient_checkpointing: bool = True
 
 
+@dataclass
+class DynamicsConfig(BaseConfig):
+    """Dynamics model configuration (Dreamer 4 paper)."""
+    # Architecture
+    embed_dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 24
+    temporal_layer_freq: int = 4  # Time attention every N layers
+
+    # Tokenization
+    num_spatial_tokens: int = 256  # S_z per timestep
+    latent_dim: int = 128
+    num_register_tokens: int = 8  # S_r per timestep
+
+    # Actions
+    num_actions: int = 12  # Discrete action vocabulary
+    num_action_tokens: int = 1  # S_a per action
+
+    # Shortcut forcing
+    max_sampling_steps: int = 64  # K_max
+    num_inference_steps: int = 4  # K for generation
+    ramp_weight: bool = True  # w(τ) = 0.9τ + 0.1
+
+    # Memory optimization
+    gradient_checkpointing: bool = True
+
+
 # =============================================================================
 # Training Config (reusable across models)
 # =============================================================================
@@ -129,6 +156,7 @@ class ExperimentConfig(BaseConfig):
 
     # Sub-configs
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
+    dynamics: DynamicsConfig = field(default_factory=DynamicsConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     # Logging

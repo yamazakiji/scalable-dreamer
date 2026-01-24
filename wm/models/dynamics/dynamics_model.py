@@ -40,8 +40,6 @@ class DynamicsModel(nn.Module):
         num_actions: int = 18,
         num_action_tokens: int = 1,
         max_sampling_steps: int = 64,
-        ffn_mult: float = 4.0,
-        dropout: float = 0.0,
     ):
         """
         Args:
@@ -55,8 +53,6 @@ class DynamicsModel(nn.Module):
             num_actions: Size of discrete action vocabulary
             num_action_tokens: Number of tokens per action (S_a)
             max_sampling_steps: Maximum sampling steps K_max (for τ, d embeddings)
-            ffn_mult: FFN hidden dimension multiplier
-            dropout: Dropout rate
         """
         super().__init__()
 
