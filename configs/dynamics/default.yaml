@@ -1,0 +1,31 @@
+name: dynamics_default
+seed: 42
+
+dynamics:
+  embed_dim: 512
+  num_heads: 8
+  num_layers: 24
+  temporal_layer_freq: 4
+  num_spatial_tokens: 256
+  latent_dim: 32
+  num_register_tokens: 8
+  num_actions: 12
+  num_action_tokens: 1
+  max_sampling_steps: 64
+  ramp_weight: true
+  gradient_checkpointing: true
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+  grad_clip: 1.0
+  batch_size: 1
+  checkpoint_every: 10000
+  eval_every: 1000
+  log_every: 100
+  save_dir: outputs
+
+use_wandb: true
+wandb_project: world_models

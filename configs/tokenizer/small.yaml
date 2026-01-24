@@ -1,0 +1,16 @@
+name: tokenizer_small
+seed: 42
+
+tokenizer:
+  embed_dim: 256
+  num_heads: 4
+  num_latents: 32
+  latent_dim: 64
+  gradient_checkpointing: false
+
+training:
+  max_steps: 100
+  eval_every: 50
+  log_every: 10
+
+use_wandb: false

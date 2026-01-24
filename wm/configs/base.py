@@ -67,23 +67,15 @@ class BaseConfig:
 class TokenizerConfig(BaseConfig):
     """Causal tokenizer model configuration."""
     # Input
-    image_height: int = 224
-    image_width: int = 320
+    image_size: int = 224
     patch_size: int = 16
+    in_channels: int = 3
 
     # Architecture
-    dim: int = 512
-    dim_latent: int = 32
-    num_latent_tokens: int = 64
-    num_register_tokens: int = 8
-    encoder_layers: int = 3
-    decoder_layers: int = 3
+    embed_dim: int = 512
     num_heads: int = 8
-    dropout: float = 0.0
-
-    # Masking (training behavior)
-    mask_ratio_min: float = 0.0
-    mask_ratio_max: float = 0.9
+    num_latents: int = 128
+    latent_dim: int = 128
 
     # Memory optimization
     gradient_checkpointing: bool = True
@@ -100,7 +92,7 @@ class DynamicsConfig(BaseConfig):
 
     # Tokenization
     num_spatial_tokens: int = 256  # S_z per timestep
-    latent_dim: int = 128
+    latent_dim: int = 32
     num_register_tokens: int = 8  # S_r per timestep
 
     # Actions
@@ -135,7 +127,7 @@ class TrainingConfig(BaseConfig):
     num_workers: int = 0
 
     checkpoint_every: int = 10_000
-    eval_every: int = 5_000
+    eval_every: int = 1_000
     log_every: int = 100
     save_dir: str = "outputs"
 

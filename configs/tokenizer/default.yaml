@@ -1,0 +1,28 @@
+name: tokenizer_default
+seed: 42
+
+tokenizer:
+  image_size: 224
+  patch_size: 16
+  in_channels: 3
+  embed_dim: 512
+  num_heads: 8
+  num_latents: 128
+  latent_dim: 128
+  gradient_checkpointing: true
+
+training:
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  max_steps: 100000
+  grad_clip: 1.0
+  batch_size: 1
+  num_workers: 0
+  checkpoint_every: 10000
+  eval_every: 1000
+  log_every: 100
+  save_dir: outputs
+
+use_wandb: true
+wandb_project: world_models

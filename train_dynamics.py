@@ -20,10 +20,14 @@ from pathlib import Path
 from wm.configs.base import ExperimentConfig
 from wm.models.dynamics.dynamics_model import DynamicsModel
 from wm.models.dynamics.shortcut_forcing import ShortcutForcing
+from wm.models.dynamics.inference import denoise_frame
 from wm.data.latent_dataset import LatentDataset
 from wm.training.distributed import setup_distributed, cleanup_distributed, wrap_model_ddp
 from wm.training.optimizer import get_optimizer, get_warmup_scheduler
 from wm.utils.logging import WandbLogger
+from wm.utils.metrics import compute_latent_metrics
+from wm.utils.evaluation import prepare_eval_batch, aggregate_metrics, log_evaluation
+from wm.utils.io import save_frame_outputs, save_evaluation_summary
 
 # FSDP imports (optional, only used when --fsdp is enabled)
 try:
@@ -82,66 +86,160 @@ def train_step(
 
 
 @torch.no_grad()
-def evaluate(
+def evaluate_detailed(
     model: nn.Module,
     eval_dataloader: DataLoader,
     logger,
     step: int,
     device: torch.device,
+    output_dir: str = "outputs",
     rank: int = 0,
-    num_inference_steps: int = 4,
+    num_inference_steps_list: list[int] | None = None,
+    num_frames_to_evaluate: int = 4,
+    save_outputs: bool = True,
     use_fsdp: bool = False,
 ):
-    """Evaluation phase for DynamicsModel with autoregressive sampling."""
+    """
+    Detailed evaluation with step-by-step denoising visibility.
+
+    Simulates real inference for multiple K values:
+    1. Take context frames
+    2. For each target frame, for each K in [4, 8, 30]:
+       - Start from same noise seed (for fair comparison)
+       - Run K denoising steps
+       - Track intermediate predictions at each step
+       - Compare to ground truth
+    3. Save all outputs and compute comparative metrics
+
+    Args:
+        model: DynamicsModel
+        eval_dataloader: DataLoader for evaluation data
+        logger: WandbLogger or None
+        step: Current training step
+        device: Device to run on
+        output_dir: Directory to save outputs
+        rank: Process rank for distributed training
+        num_inference_steps_list: List of K values to evaluate (default: [4, 8, 30])
+        num_frames_to_evaluate: Number of frames to generate per sequence
+        save_outputs: Whether to save outputs to disk
+        use_fsdp: Whether FSDP is being used
+    """
+    K_values = num_inference_steps_list or [4, 8, 30]
+
     model.eval()
 
-    batch = next(iter(eval_dataloader))
-    batch = {k: v.to(device) for k, v in batch.items()}
+    # 1. Prepare batch
+    batch_data = prepare_eval_batch(
+        eval_dataloader, device, context_len=4, max_gen_len=num_frames_to_evaluate
+    )
+    z_context = batch_data["z_context"]
+    z_target_all = batch_data["z_targets"]
+    actions = batch_data["actions"]
+    context_len = batch_data["context_len"]
+    gen_len = batch_data["gen_len"]
+    B, _, N, D = batch_data["batch_shape"]
 
-    B, T, N, D = batch["z"].shape
-    context_len = min(4, T // 2)  # Use first few frames as context
-    gen_len = T - context_len
+    # 2. Setup - add noise to context
+    context_noise = 0.1
+    noise = torch.randn_like(z_context)
+    z_context_noisy = (1 - context_noise) * z_context + context_noise * noise
 
-    z_context = batch["z"][:, :context_len]  # (B, ctx_len, N, D)
-    actions = batch["a"][:, context_len:]    # (B, gen_len) actions for generation
-    z_target = batch["z_next"][:, context_len:]  # (B, gen_len, N, D) targets
+    # Create output directory
+    eval_output_dir = Path(output_dir) / f"eval_step_{step}"
+    if save_outputs and rank == 0:
+        eval_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Store all metrics for logging
     all_metrics = {}
 
+    # Generate frames autoregressively, comparing all K values
+    z_history_by_K = {K: z_context_noisy.clone() for K in K_values}
+
+    # Use a fixed seed for fair comparison across K values
+    base_seed = step * 1000
+
+    # 3. Generation loop
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        # Autoregressive sampling
-        z_generated = model.sample(
-            z_context,
-            actions,
-            num_steps=num_inference_steps,
-            context_noise=0.1,
-        )
+        for t in range(gen_len):
+            frame_idx = context_len + t
+            action_t = actions[:, frame_idx:frame_idx + 1]  # (B, 1)
+            z_target = z_target_all[:, t:t + 1]  # (B, 1, N, D)
 
-        # Compute MSE between generated and target (up to generated length)
-        gen_frames = min(z_generated.shape[1], z_target.shape[1])
-        mse = nn.functional.mse_loss(
-            z_generated[:, :gen_frames],
-            z_target[:, :gen_frames]
-        )
-        all_metrics["eval/mse"] = mse.item()
+            frame_results = {}
 
-        # Per-step MSE for first few frames
-        for t in range(min(4, gen_frames)):
-            step_mse = nn.functional.mse_loss(z_generated[:, t], z_target[:, t])
-            all_metrics[f"eval/mse_step_{t+1}"] = step_mse.item()
+            for K in K_values:
+                # Get current context for this K
+                z_ctx = z_history_by_K[K]
+                T_ctx = z_ctx.shape[1]
+
+                # Use same seed for all K values (fair comparison)
+                generator = torch.Generator(device=device)
+                generator.manual_seed(base_seed + t)
+
+                # Run denoising with K steps
+                intermediates = denoise_frame(
+                    model=model,
+                    z_context_noisy=z_ctx[:, -context_len:] if T_ctx > context_len else z_ctx,
+                    z_target_shape=(B, 1, N, D),
+                    action_t=action_t,
+                    K=K,
+                    context_noise=context_noise,
+                    device=device,
+                    generator=generator,
+                )
+
+                # Get final prediction
+                z_pred_final = intermediates[-1]["z_pred"].to(device)
+
+                # Compute metrics for final prediction
+                final_metrics = compute_latent_metrics(z_pred_final, z_target)
+
+                # Compute per-step metrics
+                step_metrics = []
+                for inter in intermediates:
+                    step_m = compute_latent_metrics(inter["z_pred"].to(device), z_target)
+                    step_metrics.append({
+                        "step": inter["step"],
+                        "tau": inter["tau"],
+                        "d": inter["d"],
+                        "mse": step_m["mse"],
+                        "cosine_sim": step_m["cosine_sim"],
+                    })
+
+                frame_results[K] = {
+                    "intermediates": intermediates,
+                    "final_metrics": final_metrics,
+                    "step_metrics": step_metrics,
+                }
+
+                # Update history for this K
+                z_history_by_K[K] = torch.cat([z_history_by_K[K], z_pred_final], dim=1)
+
+                # Log metrics for this K and frame
+                all_metrics[f"eval/K{K}_frame{t}_mse"] = final_metrics["mse"]
+                all_metrics[f"eval/K{K}_frame{t}_cosine_sim"] = final_metrics["cosine_sim"]
+
+                # Log step-wise progression for first frame
+                if t == 0:
+                    for sm in step_metrics:
+                        all_metrics[f"eval/K{K}_step{sm['step']}_mse"] = sm["mse"]
+
+            # Save outputs for this frame (only on rank 0)
+            if save_outputs and rank == 0:
+                batch_dir = eval_output_dir / "batch_0"
+                save_frame_outputs(batch_dir, t, z_target, frame_results, K_values)
+
+    # 4. Aggregate and log
+    all_metrics = aggregate_metrics(all_metrics, K_values, gen_len)
+
+    if save_outputs and rank == 0:
+        save_evaluation_summary(eval_output_dir, step, context_len, gen_len, K_values, all_metrics)
 
     if rank == 0:
-        if logger:
-            if use_fsdp and FSDP_AVAILABLE:
-                local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                mem_stats = get_memory_stats(local_rank)
-                all_metrics.update({f"memory/{k}": v for k, v in mem_stats.items()})
-            logger.log(all_metrics, step=step)
-
-        print(f"\nEvaluation at step {step}:")
-        print(f"  MSE (avg): {all_metrics.get('eval/mse', 0):.6f}")
-        for t in range(min(4, gen_frames)):
-            print(f"  MSE step {t+1}: {all_metrics.get(f'eval/mse_step_{t+1}', 0):.6f}")
+        log_evaluation(
+            logger, all_metrics, step, K_values,
+            eval_output_dir if save_outputs else None, use_fsdp
+        )
 
     model.train()
 
@@ -315,9 +413,17 @@ def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_f
             if step > 0 and step % config.training.eval_every == 0:
                 if is_main:
                     print(f"\nRunning evaluation at step {step}...")
-                evaluate(
-                    model, eval_dataloader, logger, step, device, rank,
-                    num_inference_steps=config.dynamics.num_inference_steps,
+                evaluate_detailed(
+                    model=model,
+                    eval_dataloader=eval_dataloader,
+                    logger=logger,
+                    step=step,
+                    device=device,
+                    output_dir=str(Path(config.training.save_dir) / config.name / "eval"),
+                    rank=rank,
+                    num_inference_steps_list=[4, 8, 30],
+                    num_frames_to_evaluate=4,
+                    save_outputs=is_main,
                     use_fsdp=use_fsdp,
                 )
 
@@ -368,6 +474,13 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP instead of DDP")
     parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument(
+        "--set", "-s",
+        action="append",
+        dest="overrides",
+        metavar="KEY=VALUE",
+        help="Override config values (e.g., --set training.learning_rate=0.001)"
+    )
 
     # Data arguments
     parser.add_argument("--latent-dir", type=str, default="./data/latents",
@@ -375,7 +488,7 @@ def main():
     parser.add_argument("--sequence-length", type=int, default=16,
                         help="Sequence length for training")
 
-    # Training overrides
+    # Training overrides (legacy, prefer --set)
     parser.add_argument("--max-steps", type=int, help="Override max training steps")
     parser.add_argument("--batch-size", type=int, help="Override batch size")
     parser.add_argument("--lr", type=float, help="Override learning rate")
@@ -391,15 +504,32 @@ def main():
             use_wandb=not args.no_wandb,
         )
 
-    # Apply overrides
+    # Apply legacy overrides
     if args.resume:
-        config.training.resume_from = args.resume
+        config = config.update(**{"training.resume_from": args.resume})
     if args.max_steps:
-        config.training.max_steps = args.max_steps
+        config = config.update(**{"training.max_steps": args.max_steps})
     if args.batch_size:
-        config.training.batch_size = args.batch_size
+        config = config.update(**{"training.batch_size": args.batch_size})
     if args.lr:
-        config.training.learning_rate = args.lr
+        config = config.update(**{"training.learning_rate": args.lr})
+
+    # Apply generic overrides
+    if args.overrides:
+        for override in args.overrides:
+            key, value = override.split("=", 1)
+            # Parse value type
+            if value.lower() in ("true", "false"):
+                value = value.lower() == "true"
+            else:
+                try:
+                    value = int(value)
+                except ValueError:
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass  # Keep as string
+            config = config.update(**{key: value})
 
     train(config, args.latent_dir, args.sequence_length, use_fsdp=args.fsdp)
 

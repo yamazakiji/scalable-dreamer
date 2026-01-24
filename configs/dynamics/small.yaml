@@ -1,0 +1,17 @@
+name: dynamics_small
+seed: 42
+
+dynamics:
+  embed_dim: 256
+  num_heads: 4
+  num_layers: 8
+  num_spatial_tokens: 64
+  latent_dim: 32
+  gradient_checkpointing: false
+
+training:
+  max_steps: 100
+  eval_every: 50
+  log_every: 10
+
+use_wandb: false

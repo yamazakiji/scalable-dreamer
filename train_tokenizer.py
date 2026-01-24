@@ -156,6 +156,13 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
     torch.manual_seed(config.seed + rank)
 
     model = CausalTokenizer(
+        img_size=config.tokenizer.image_size,
+        patch_size=config.tokenizer.patch_size,
+        in_channels=config.tokenizer.in_channels,
+        embed_dim=config.tokenizer.embed_dim,
+        num_heads=config.tokenizer.num_heads,
+        num_latents=config.tokenizer.num_latents,
+        latent_dim=config.tokenizer.latent_dim,
         gradient_checkpointing=config.tokenizer.gradient_checkpointing,
     ).to(device)
 
@@ -328,6 +335,13 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--fsdp", action="store_true", help="Use FSDP instead of DDP")
     parser.add_argument("--resume", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument(
+        "--set", "-s",
+        action="append",
+        dest="overrides",
+        metavar="KEY=VALUE",
+        help="Override config values (e.g., --set training.learning_rate=0.001)"
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -340,7 +354,24 @@ def main():
         )
 
     if args.resume:
-        config.training.resume_from = args.resume
+        config = config.update(**{"training.resume_from": args.resume})
+
+    # Apply generic overrides
+    if args.overrides:
+        for override in args.overrides:
+            key, value = override.split("=", 1)
+            # Parse value type
+            if value.lower() in ("true", "false"):
+                value = value.lower() == "true"
+            else:
+                try:
+                    value = int(value)
+                except ValueError:
+                    try:
+                        value = float(value)
+                    except ValueError:
+                        pass  # Keep as string
+            config = config.update(**{key: value})
 
     train(config, use_fsdp=args.fsdp)
 
