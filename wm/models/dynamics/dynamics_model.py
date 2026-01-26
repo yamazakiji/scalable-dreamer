@@ -60,7 +60,7 @@ class DynamicsModel(nn.Module):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.temporal_layer_freq = temporal_layer_freq
-        self.num_spatial_tokens = num_spatial_tokens
+        self.num_spatial_tokens = num_spatial_tokens  # Useless parameter, TODO: remove
         self.latent_dim = latent_dim
         self.num_register_tokens = num_register_tokens
         self.num_action_tokens = num_action_tokens

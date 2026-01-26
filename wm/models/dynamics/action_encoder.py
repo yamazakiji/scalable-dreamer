@@ -31,7 +31,7 @@ class ActionEncoder(nn.Module):
         self.num_tokens = num_tokens
 
         # Action embedding lookup
-        self.action_embed = nn.Embedding(num_actions, embed_dim)
+        self.action_embed = nn.Linear(num_actions, embed_dim, bias=False)  # for now, to handle multi discrete action space
 
         # Learned embedding summed with action (used alone for unlabeled videos)
         self.learned_token = nn.Parameter(torch.randn(1, 1, num_tokens, embed_dim) * 0.02)
@@ -53,13 +53,10 @@ class ActionEncoder(nn.Module):
             B, T = actions.shape if actions is not None else (1, 1)
             return self.learned_token.expand(B, T, -1, -1)
         
-        if len(actions.shape) > 2:
-            # assume its one hot encoded actions
-            actions = actions.argmax(dim=-1) # (B, T)
 
-        B, T = actions.shape
+        B, T, _ = actions.shape
 
-        # Embed actions: (B, T) -> (B, T, embed_dim)
+        # Embed actions: (B, T, num_buttons) -> (B, T, embed_dim)
         action_emb = self.action_embed(actions)
 
         # Expand to num_tokens: (B, T, num_tokens, embed_dim)

@@ -52,7 +52,7 @@ class VideoDataset(Dataset):
         self,
         video_dir: str,
         sequence_length: int = 384,
-        frame_size: tuple[int, int] = (224, 224),
+        frame_size: tuple[int, int] = (128, 128),
     ):
         self.video_dir = Path(video_dir)
         self.sequence_length = sequence_length

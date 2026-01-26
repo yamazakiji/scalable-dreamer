@@ -27,7 +27,7 @@ class LatentDataset(Dataset):
     def __init__(
         self,
         latent_dir: str,
-        sequence_length: int = 16,
+        sequence_length: int = 128,
     ):
         """
         Args:
@@ -107,7 +107,7 @@ class LatentDataset(Dataset):
 
         return {
             "z": episode["z"][start:end],
-            "a": episode["a"][start:end],
+            "a": episode["a"][start:end].float(),
             "z_next": episode["z_next"][start:end],
         }
 

@@ -487,7 +487,7 @@ def main():
     # Data arguments
     parser.add_argument("--latent-dir", type=str, default="./data/latents",
                         help="Directory containing extracted latents")
-    parser.add_argument("--sequence-length", type=int, default=16,
+    parser.add_argument("--sequence-length", type=int, default=128,
                         help="Sequence length for training")
 
     # Training overrides (legacy, prefer --set)
