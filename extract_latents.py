@@ -204,7 +204,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create model and load checkpoint
-    model = CausalTokenizer().to(device)
+    model = CausalTokenizer(img_size=128, latent_dim=64).to(device)
 
     if is_main:
         num_params = sum(p.numel() for p in model.parameters())

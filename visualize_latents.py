@@ -1,233 +1,354 @@
-"""Visualize latent representations from dynamics model evaluation.
+"""Visualize world models pipeline: encode -> dynamics -> decode.
 
-Decodes latent tensors back to images using CausalTokenizer and generates
-detailed visualizations of denoising progression.
+Demonstrates the full pipeline comparing teacher forcing vs autoregressive
+generation modes, producing GIF visualizations.
 
 Usage:
     python visualize_latents.py \
-        --eval-folder outputs/dreamer4_dynamics/eval/eval_step_1000/batch_0 \
+        --video-source 0 \
+        --data-dir ./data \
         --tokenizer-checkpoint outputs/dreamer4_tokenizer/checkpoint_step_30000.pt \
-        --fsdp
+        --dynamics-checkpoint outputs/dynamics_default/checkpoint_step_40000.pt \
+        --output-dir outputs/visualizations/test \
+        --num-frames 100 \
+        --midpoint 50
 """
 
 import argparse
-import re
 from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
+from tqdm import tqdm
 
 from wm.models.tokenizer.causal_tokenizer import CausalTokenizer
+from wm.models.dynamics.dynamics_model import DynamicsModel
+from wm.models.dynamics.inference import denoise_frame
+from wm.data.video_dataset import VideoDataset
+
+
+# Fixed parameters from plan
+K = 4  # Denoising steps
+CONTEXT_WINDOW = 128  # Model's training sequence length
+CONTEXT_NOISE = 0.1
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Visualize latent representations")
+    parser = argparse.ArgumentParser(
+        description="Visualize world models encode->dynamics->decode pipeline"
+    )
     parser.add_argument(
-        "--eval-folder",
+        "--video-source",
+        type=int,
+        default=0,
+        help="Episode index (default: 0)",
+    )
+    parser.add_argument(
+        "--data-dir",
         type=str,
-        required=True,
-        help="Path to eval batch folder containing frame_* directories",
+        default="./data",
+        help="Video data directory (default: ./data)",
     )
     parser.add_argument(
         "--tokenizer-checkpoint",
         type=str,
         required=True,
-        help="Path to tokenizer .pt checkpoint file",
+        help="Path to tokenizer .pt file",
+    )
+    parser.add_argument(
+        "--dynamics-checkpoint",
+        type=str,
+        required=True,
+        help="Path to dynamics .pt file",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default=None,
-        help="Output directory (default: {eval_folder}/visualizations)",
+        default="outputs/visualizations",
+        help="Output directory for visualizations",
     )
     parser.add_argument(
-        "--fsdp",
-        action="store_true",
-        help="Enable FSDP for memory-efficient model loading",
+        "--num-frames",
+        type=int,
+        default=100,
+        help="Total frames to process (default: 100)",
     )
     parser.add_argument(
-        "--no-gif",
-        action="store_true",
-        help="Skip GIF generation",
+        "--midpoint",
+        type=int,
+        default=50,
+        help="Frame to switch to autoregressive (default: 50)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=10,
+        help="GIF frame rate (default: 10)",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use (cuda/cpu)",
+        default="auto",
+        help="Device: cuda/cpu/auto (default: auto)",
     )
     return parser.parse_args()
 
 
-def load_tokenizer(checkpoint_path: str, device: str, use_fsdp: bool = False) -> CausalTokenizer:
-    """Load CausalTokenizer from checkpoint."""
-    model = CausalTokenizer().to(device)
+def get_device(device_arg: str) -> str:
+    """Resolve device argument to actual device."""
+    if device_arg == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device_arg
 
-    # Load checkpoint and strip DDP/FSDP prefix if present
+
+def load_tokenizer(checkpoint_path: str, device: str) -> CausalTokenizer:
+    """Load CausalTokenizer from checkpoint."""
+    model = CausalTokenizer(img_size=128, latent_dim=64).to(device)
+
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint["model_state_dict"]
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
 
-    if use_fsdp:
-        import torch.distributed as dist
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://", world_size=1, rank=0)
-        from wm.training.fsdp import apply_fsdp
-        model = apply_fsdp(model, mixed_precision="bf16")
+    model.eval()
+    return model
+
+
+def load_dynamics_model(checkpoint_path: str, device: str) -> DynamicsModel:
+    """Load DynamicsModel from checkpoint with hardcoded config."""
+    model = DynamicsModel(
+        embed_dim=512,
+        num_heads=8,
+        num_layers=24,
+        temporal_layer_freq=4,
+        num_spatial_tokens=128,  # Matches tokenizer
+        latent_dim=64,  # dont forget to change back
+        num_register_tokens=8,
+        num_actions=12,
+        num_action_tokens=1,
+        max_sampling_steps=64,
+    ).to(device)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint["model_state_dict"]
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
 
     model.eval()
     return model
 
 
 @torch.no_grad()
-def decode_latent(tokenizer: CausalTokenizer, z: torch.Tensor, device: str) -> np.ndarray:
-    """Decode a latent tensor to an image array.
+def encode_video(
+    tokenizer: CausalTokenizer,
+    frames: torch.Tensor,
+    device: str,
+    batch_size: int = 16,
+) -> torch.Tensor:
+    """Encode video frames to latents.
 
     Args:
         tokenizer: CausalTokenizer model
-        z: Latent tensor of shape (1, 1, num_latents, latent_dim) or (1, 1, 128, 128)
+        frames: (T, C, H, W) video frames
         device: Device to use
+        batch_size: Batch size for memory efficiency
 
     Returns:
-        Image as numpy array of shape (H, W, 3) with uint8 dtype
+        z: (T, N, D) latent representations
     """
-    z = z.to(device=device, dtype=torch.float32)
+    T = frames.shape[0]
+    latents = []
 
-    with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
-        recon = tokenizer.decode(z)  # (1, 1, 3, H, W)
+    for i in range(0, T, batch_size):
+        batch = frames[i : i + batch_size]  # (B, C, H, W)
+        batch = batch.unsqueeze(1).to(device)  # (B, 1, C, H, W) - single frame per "video"
 
-    recon = recon.squeeze()  # (3, H, W)
-    recon = torch.clamp(recon, 0, 1)
-    return (recon.permute(1, 2, 0) * 255).to(torch.uint8).cpu().numpy()
+        with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
+            z = tokenizer.tokenize(batch)  # (B, 1, N, D)
 
+        z = z.squeeze(1).cpu()  # (B, N, D)
+        latents.append(z)
 
-def discover_frames(eval_folder: Path) -> list[Path]:
-    """Find all frame_* directories sorted by frame number."""
-    frame_dirs = sorted(
-        eval_folder.glob("frame_*"),
-        key=lambda p: int(re.search(r"frame_(\d+)", p.name).group(1)),
-    )
-    return frame_dirs
+    return torch.cat(latents, dim=0)  # (T, N, D)
 
 
-def discover_k_values(frame_dir: Path) -> list[int]:
-    """Find all K* subdirectories and return K values sorted."""
-    k_dirs = list(frame_dir.glob("K*"))
-    k_values = sorted(int(d.name[1:]) for d in k_dirs if d.is_dir())
-    return k_values
-
-
-def discover_steps(k_dir: Path) -> list[int]:
-    """Find all z_pred_step_*.pt files and return step numbers sorted."""
-    step_files = list(k_dir.glob("z_pred_step_*.pt"))
-    steps = sorted(int(re.search(r"z_pred_step_(\d+)", f.name).group(1)) for f in step_files)
-    return steps
-
-
-def create_side_by_side(
-    target_img: np.ndarray,
-    predicted_imgs: dict[int, np.ndarray],
-    k_values: list[int],
-) -> Image.Image:
-    """Create horizontal strip: Target | K4 | K8 | K30.
+@torch.no_grad()
+def decode_latents(
+    tokenizer: CausalTokenizer,
+    latents: torch.Tensor,
+    device: str,
+    batch_size: int = 16,
+) -> list[np.ndarray]:
+    """Decode latents to images.
 
     Args:
-        target_img: Target image array (H, W, 3)
-        predicted_imgs: Dict mapping K value to final predicted image
-        k_values: List of K values to include
+        tokenizer: CausalTokenizer model
+        latents: (T, N, D) latent representations
+        device: Device to use
+        batch_size: Batch size for memory efficiency
 
     Returns:
-        PIL Image with side-by-side comparison
+        List of (H, W, 3) uint8 numpy arrays
     """
-    h, w = target_img.shape[:2]
-    n_images = 1 + len(k_values)
-    padding = 10
-    label_height = 30
+    T = latents.shape[0]
+    images = []
 
-    total_width = n_images * w + (n_images - 1) * padding
-    total_height = h + label_height
+    for i in range(0, T, batch_size):
+        batch = latents[i : i + batch_size]  # (B, N, D)
+        batch = batch.unsqueeze(1).to(device=device, dtype=torch.float32)  # (B, 1, N, D)
 
-    canvas = Image.new("RGB", (total_width, total_height), (255, 255, 255))
+        with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
+            recon = tokenizer.decode(batch)  # (B, 1, C, H, W)
 
-    # Paste target
-    x_offset = 0
-    canvas.paste(Image.fromarray(target_img), (x_offset, label_height))
+        recon = recon.squeeze(1)  # (B, C, H, W)
+        recon = torch.clamp(recon, 0, 1)
+        recon = (recon.permute(0, 2, 3, 1) * 255).to(torch.uint8).cpu().numpy()
 
-    # Add label
-    from PIL import ImageDraw
-    draw = ImageDraw.Draw(canvas)
-    draw.text((x_offset + w // 2 - 20, 5), "Target", fill=(0, 0, 0))
+        for j in range(recon.shape[0]):
+            images.append(recon[j])
 
-    # Paste predictions
-    for k in k_values:
-        x_offset += w + padding
-        if k in predicted_imgs:
-            canvas.paste(Image.fromarray(predicted_imgs[k]), (x_offset, label_height))
-            draw.text((x_offset + w // 2 - 10, 5), f"K{k}", fill=(0, 0, 0))
-
-    return canvas
+    return images
 
 
-def create_denoising_grid(
-    step_images: list[np.ndarray],
-    k_value: int,
-    cols: int = 4,
-) -> Image.Image:
-    """Create a grid showing denoising progression.
+def add_noise(z: torch.Tensor, noise_level: float) -> torch.Tensor:
+    """Add noise to latent representations."""
+    noise = torch.randn_like(z)
+    return (1 - noise_level) * z + noise_level * noise
+
+
+@torch.no_grad()
+def run_teacher_forcing(
+    dynamics: DynamicsModel,
+    z_gt: torch.Tensor,
+    actions: torch.Tensor,
+    device: str,
+) -> torch.Tensor:
+    """Run teacher forcing prediction.
+
+    For each frame, use ground truth history as context.
 
     Args:
-        step_images: List of images for each denoising step
-        k_value: K value for labeling
-        cols: Number of columns in grid
+        dynamics: DynamicsModel
+        z_gt: (T, N, D) ground truth latents
+        actions: (T, 12) boolean actions
+        device: Device
 
     Returns:
-        PIL Image with grid layout
+        z_pred_tf: (T, N, D) teacher forcing predictions
     """
-    if not step_images:
-        return Image.new("RGB", (100, 100), (255, 255, 255))
+    T, N, D = z_gt.shape
+    z_pred_tf = torch.zeros_like(z_gt)
 
-    h, w = step_images[0].shape[:2]
-    n_steps = len(step_images)
-    rows = (n_steps + cols - 1) // cols
-    padding = 5
-    label_height = 20
+    for t in tqdm(range(T), desc="Teacher forcing"):
+        # Use as much ground truth history as available (up to CONTEXT_WINDOW frames)
+        ctx_start = max(0, t - CONTEXT_WINDOW)
+        z_context = z_gt[ctx_start:t]  # Ground truth context
 
-    total_width = cols * w + (cols - 1) * padding
-    total_height = rows * (h + label_height) + (rows - 1) * padding
+        if z_context.shape[0] == 0:
+            # No context available (first frame) - use zeros
+            z_context = torch.zeros(1, N, D)
 
-    canvas = Image.new("RGB", (total_width, total_height), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
+        # Add noise to context
+        z_context_noisy = add_noise(z_context, CONTEXT_NOISE)
 
-    for i, img in enumerate(step_images):
-        row = i // cols
-        col = i % cols
-        x = col * (w + padding)
-        y = row * (h + label_height + padding)
+        # Prepare action for current frame
+        action_t = actions[t : t + 1].unsqueeze(0).to(device)  # (1, 1, 12)
 
-        canvas.paste(Image.fromarray(img), (x, y + label_height))
-        draw.text((x + 5, y + 2), f"Step {i}", fill=(0, 0, 0))
+        intermediates = denoise_frame(
+            model=dynamics,
+            z_context_noisy=z_context_noisy.unsqueeze(0).to(device),
+            z_target_shape=(1, 1, N, D),
+            action_t=action_t,
+            K=K,
+            context_noise=CONTEXT_NOISE,
+            device=device,
+        )
 
-    return canvas
+        z_pred_tf[t] = intermediates[-1]["z_pred"].squeeze(0).squeeze(0)  # (N, D)
+
+    return z_pred_tf
 
 
-def create_denoising_gif(
-    step_images: list[np.ndarray],
+@torch.no_grad()
+def run_autoregressive(
+    dynamics: DynamicsModel,
+    z_gt: torch.Tensor,
+    actions: torch.Tensor,
+    midpoint: int,
+    device: str,
+) -> torch.Tensor:
+    """Run autoregressive prediction from midpoint.
+
+    Uses ground truth for frames [0:midpoint], then autoregressively
+    generates frames [midpoint:T].
+
+    Args:
+        dynamics: DynamicsModel
+        z_gt: (T, N, D) ground truth latents
+        actions: (T, 12) boolean actions
+        midpoint: Frame index to start autoregressive generation
+        device: Device
+
+    Returns:
+        z_pred_ar: (T, N, D) predictions (GT for [0:midpoint], AR for rest)
+    """
+    T, N, D = z_gt.shape
+    z_pred_ar = z_gt.clone()  # Start with ground truth
+
+    # Build history: ground truth prefix
+    z_history = z_gt[:midpoint].clone()
+
+    for t in tqdm(range(midpoint, T), desc="Autoregressive"):
+        # Use as much history as available (up to CONTEXT_WINDOW frames)
+        ctx_start = max(0, len(z_history) - CONTEXT_WINDOW)
+        z_context = z_history[ctx_start:]  # Mix of GT prefix + predictions
+
+        # Add noise to context
+        z_context_noisy = add_noise(z_context, CONTEXT_NOISE)
+
+        # Prepare action for current frame (use GT actions throughout)
+        action_t = actions[t : t + 1].unsqueeze(0).to(device)  # (1, 1, 12)
+
+        intermediates = denoise_frame(
+            model=dynamics,
+            z_context_noisy=z_context_noisy.unsqueeze(0).to(device),
+            z_target_shape=(1, 1, N, D),
+            action_t=action_t,
+            K=K,
+            context_noise=CONTEXT_NOISE,
+            device=device,
+        )
+
+        z_pred_t = intermediates[-1]["z_pred"].squeeze(0)  # (1, N, D)
+
+        # Store prediction
+        z_pred_ar[t] = z_pred_t.squeeze(0)  # (N, D)
+
+        # Append prediction to history for next iteration
+        z_history = torch.cat([z_history, z_pred_t.cpu()], dim=0)
+
+    return z_pred_ar
+
+
+def create_gif(
+    images: list[np.ndarray],
     output_path: Path,
-    duration: int = 200,
+    fps: int = 10,
 ) -> None:
-    """Create animated GIF of denoising progression.
+    """Create GIF from list of images.
 
     Args:
-        step_images: List of images for each denoising step
+        images: List of (H, W, 3) uint8 numpy arrays
         output_path: Path to save GIF
-        duration: Duration per frame in milliseconds
+        fps: Frames per second
     """
-    if not step_images:
+    if not images:
         return
 
-    frames = [Image.fromarray(img) for img in step_images]
+    frames = [Image.fromarray(img) for img in images]
+    duration = int(1000 / fps)  # milliseconds per frame
+
     frames[0].save(
         output_path,
         save_all=True,
@@ -237,165 +358,163 @@ def create_denoising_gif(
     )
 
 
-def create_summary_grid(
-    all_frame_data: dict[int, dict],
-    k_values: list[int],
-) -> Image.Image:
-    """Create summary grid: rows=frames, cols=Target+K values.
+def create_comparison_gif(
+    original: list[np.ndarray],
+    reconstruction: list[np.ndarray],
+    teacher_forcing: list[np.ndarray],
+    autoregressive: list[np.ndarray],
+    output_path: Path,
+    fps: int = 10,
+    midpoint: int = 50,
+) -> None:
+    """Create side-by-side comparison GIF.
 
     Args:
-        all_frame_data: Dict mapping frame_idx -> {target, predictions}
-        k_values: List of K values
-
-    Returns:
-        PIL Image with summary grid
+        original: Original video frames
+        reconstruction: Tokenizer encode->decode frames
+        teacher_forcing: Teacher forcing predictions
+        autoregressive: Autoregressive predictions
+        output_path: Path to save GIF
+        fps: Frames per second
+        midpoint: Frame where AR starts (for visual indicator)
     """
-    if not all_frame_data:
-        return Image.new("RGB", (100, 100), (255, 255, 255))
+    if not original:
+        return
 
-    first_frame = next(iter(all_frame_data.values()))
-    h, w = first_frame["target"].shape[:2]
-    n_frames = len(all_frame_data)
-    n_cols = 1 + len(k_values)  # Target + K values
+    h, w = original[0].shape[:2]
+    padding = 10
+    label_height = 30
+    labels = ["Original", "Recon", "TF", "AR"]
+    n_cols = 4
 
-    padding = 5
-    label_width = 60
-    label_height = 25
+    total_width = n_cols * w + (n_cols - 1) * padding
+    total_height = h + label_height
 
-    total_width = label_width + n_cols * w + (n_cols - 1) * padding
-    total_height = label_height + n_frames * h + (n_frames - 1) * padding
+    frames = []
+    for i, (orig, recon, tf, ar) in enumerate(
+        zip(original, reconstruction, teacher_forcing, autoregressive)
+    ):
+        # Create canvas
+        canvas = Image.new("RGB", (total_width, total_height), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
 
-    canvas = Image.new("RGB", (total_width, total_height), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
+        # Paste images
+        images = [orig, recon, tf, ar]
+        for j, (img, label) in enumerate(zip(images, labels)):
+            x = j * (w + padding)
 
-    # Column headers
-    x = label_width
-    draw.text((x + w // 2 - 20, 5), "Target", fill=(0, 0, 0))
-    for k in k_values:
-        x += w + padding
-        draw.text((x + w // 2 - 10, 5), f"K{k}", fill=(0, 0, 0))
+            # Add label with indicator for AR midpoint
+            if label == "AR" and i >= midpoint:
+                label_text = f"{label}*"  # Indicate AR is now generating
+            else:
+                label_text = label
 
-    # Rows
-    for i, (frame_idx, data) in enumerate(sorted(all_frame_data.items())):
-        y = label_height + i * (h + padding)
+            draw.text((x + w // 2 - 20, 5), label_text, fill=(0, 0, 0))
+            canvas.paste(Image.fromarray(img), (x, label_height))
 
-        # Row label
-        draw.text((5, y + h // 2 - 5), f"Frame {frame_idx}", fill=(0, 0, 0))
+        frames.append(canvas)
 
-        # Target
-        x = label_width
-        canvas.paste(Image.fromarray(data["target"]), (x, y))
-
-        # Predictions
-        for k in k_values:
-            x += w + padding
-            if k in data["predictions"]:
-                canvas.paste(Image.fromarray(data["predictions"][k]), (x, y))
-
-    return canvas
-
-
-# Import ImageDraw at module level for label functions
-from PIL import ImageDraw
+    duration = int(1000 / fps)
+    frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=duration,
+        loop=0,
+    )
 
 
 def main():
     args = parse_args()
+    device = get_device(args.device)
 
-    eval_folder = Path(args.eval_folder)
-    if not eval_folder.exists():
-        raise FileNotFoundError(f"Eval folder not found: {eval_folder}")
-
-    output_dir = Path(args.output_dir) if args.output_dir else eval_folder / "visualizations"
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Using device: {device}")
+    print(f"Output directory: {output_dir}")
+
+    # Load models
     print(f"Loading tokenizer from {args.tokenizer_checkpoint}")
-    tokenizer = load_tokenizer(args.tokenizer_checkpoint, args.device, args.fsdp)
+    tokenizer = load_tokenizer(args.tokenizer_checkpoint, device)
 
-    # Discover frames
-    frame_dirs = discover_frames(eval_folder)
-    if not frame_dirs:
-        raise ValueError(f"No frame_* directories found in {eval_folder}")
+    print(f"Loading dynamics model from {args.dynamics_checkpoint}")
+    dynamics = load_dynamics_model(args.dynamics_checkpoint, device)
 
-    print(f"Found {len(frame_dirs)} frames")
+    # Load video data
+    print(f"Loading video from {args.data_dir}, episode {args.video_source}")
+    dataset = VideoDataset(
+        video_dir=args.data_dir,
+        sequence_length=args.num_frames,
+        frame_size=(128, 128),
+    )
+    frames, actions = dataset[args.video_source]
+    # frames: (T, C, H, W), actions: (T, 12)
 
-    # Get K values from first frame
-    k_values = discover_k_values(frame_dirs[0])
-    print(f"K values: {k_values}")
+    print(f"Loaded {frames.shape[0]} frames with shape {frames.shape[1:]}")
+    print(f"Actions shape: {actions.shape}")
 
-    # Store data for summary
-    all_frame_data = {}
+    # Step 1: Encode video to latents
+    print("Encoding video to latents...")
+    z_gt = encode_video(tokenizer, frames, device)  # (T, N, D)
+    print(f"Latent shape: {z_gt.shape}")
 
-    for frame_dir in frame_dirs:
-        frame_idx = int(re.search(r"frame_(\d+)", frame_dir.name).group(1))
-        print(f"\nProcessing frame {frame_idx}...")
+    # Step 2: Decode latents back to images (reconstruction baseline)
+    print("Decoding latents (reconstruction baseline)...")
+    reconstruction_images = decode_latents(tokenizer, z_gt, device)
 
-        frame_output_dir = output_dir / frame_dir.name
-        frame_output_dir.mkdir(parents=True, exist_ok=True)
+    # Step 3: Run teacher forcing
+    print("Running teacher forcing predictions...")
+    z_pred_tf = run_teacher_forcing(dynamics, z_gt, actions.float(), device)
 
-        # Load and decode target
-        target_path = frame_dir / "z_target.pt"
-        if not target_path.exists():
-            print(f"  Warning: z_target.pt not found, skipping frame")
-            continue
+    # Step 4: Run autoregressive from midpoint
+    print(f"Running autoregressive predictions from frame {args.midpoint}...")
+    z_pred_ar = run_autoregressive(
+        dynamics, z_gt, actions.float(), args.midpoint, device
+    )
 
-        z_target = torch.load(target_path, map_location="cpu", weights_only=True)
-        target_img = decode_latent(tokenizer, z_target, args.device)
+    # Step 5: Decode predictions
+    print("Decoding teacher forcing predictions...")
+    tf_images = decode_latents(tokenizer, z_pred_tf, device)
 
-        frame_data = {"target": target_img, "predictions": {}}
+    print("Decoding autoregressive predictions...")
+    ar_images = decode_latents(tokenizer, z_pred_ar, device)
 
-        for k in k_values:
-            k_dir = frame_dir / f"K{k}"
-            if not k_dir.exists():
-                print(f"  Warning: K{k} directory not found")
-                continue
+    # Step 6: Convert original frames for GIF
+    print("Preparing original frames...")
+    original_images = []
+    for i in range(frames.shape[0]):
+        img = frames[i].permute(1, 2, 0).numpy()  # (H, W, C)
+        img = (img * 255).astype(np.uint8)
+        original_images.append(img)
 
-            steps = discover_steps(k_dir)
-            if not steps:
-                print(f"  Warning: No step files found in K{k}")
-                continue
+    # Step 7: Create GIFs
+    print("Creating GIFs...")
 
-            print(f"  Processing K{k} with {len(steps)} steps")
+    create_gif(original_images, output_dir / "original.gif", args.fps)
+    print(f"  Saved: {output_dir / 'original.gif'}")
 
-            # Decode all steps
-            step_images = []
-            for step in steps:
-                z_path = k_dir / f"z_pred_step_{step}.pt"
-                z_pred = torch.load(z_path, map_location="cpu", weights_only=True)
-                step_img = decode_latent(tokenizer, z_pred, args.device)
-                step_images.append(step_img)
+    create_gif(reconstruction_images, output_dir / "reconstruction.gif", args.fps)
+    print(f"  Saved: {output_dir / 'reconstruction.gif'}")
 
-            # Store final prediction
-            if step_images:
-                frame_data["predictions"][k] = step_images[-1]
+    create_gif(tf_images, output_dir / "teacher_forcing.gif", args.fps)
+    print(f"  Saved: {output_dir / 'teacher_forcing.gif'}")
 
-            # Create denoising grid
-            grid = create_denoising_grid(step_images, k)
-            grid.save(frame_output_dir / f"denoising_K{k}_grid.png")
+    create_gif(ar_images, output_dir / "autoregressive.gif", args.fps)
+    print(f"  Saved: {output_dir / 'autoregressive.gif'}")
 
-            # Create GIF if requested
-            if not args.no_gif and step_images:
-                create_denoising_gif(
-                    step_images,
-                    frame_output_dir / f"denoising_K{k}.gif",
-                )
+    create_comparison_gif(
+        original_images,
+        reconstruction_images,
+        tf_images,
+        ar_images,
+        output_dir / "comparison.gif",
+        args.fps,
+        args.midpoint,
+    )
+    print(f"  Saved: {output_dir / 'comparison.gif'}")
 
-        # Create side-by-side comparison
-        if frame_data["predictions"]:
-            comparison = create_side_by_side(target_img, frame_data["predictions"], k_values)
-            comparison.save(frame_output_dir / "target_vs_predicted.png")
-
-        all_frame_data[frame_idx] = frame_data
-
-    # Create summary grid
-    if all_frame_data:
-        summary_dir = output_dir / "summary"
-        summary_dir.mkdir(parents=True, exist_ok=True)
-
-        summary = create_summary_grid(all_frame_data, k_values)
-        summary.save(summary_dir / "all_frames_comparison.png")
-
-    print(f"\nVisualizations saved to {output_dir}")
+    print(f"\nAll visualizations saved to {output_dir}")
 
 
 if __name__ == "__main__":
