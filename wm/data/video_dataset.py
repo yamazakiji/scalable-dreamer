@@ -58,8 +58,8 @@ class VideoDataset(Dataset):
         self.sequence_length = sequence_length
         self.frame_size = frame_size
 
-        # Discover episode folders: {video_dir}/rollouts/episodes/{NNNN}/
-        episodes_dir = self.video_dir / "rollouts" / "episodes"
+        # Discover episode folders: {video_dir}/episodes/{NNNN}/
+        episodes_dir = self.video_dir / "episodes"
         if not episodes_dir.exists():
             raise ValueError(f"Episodes directory not found: {episodes_dir}")
 

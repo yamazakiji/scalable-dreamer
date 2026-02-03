@@ -8,50 +8,50 @@ def create_reconstruction_grid(
     original: torch.Tensor,
     masked: torch.Tensor,
     reconstructed: torch.Tensor,
-    num_samples: int = 4
+    num_samples: int = 4,
+    num_frames: int = 8,
 ) -> np.ndarray:
     """
     Create a grid showing original, masked, and reconstructed images.
+
+    Selects num_frames equally-spaced time steps from the sequence.
+    Each sample produces num_frames rows (one per selected time step),
+    with columns: original | masked | reconstructed.
 
     Args:
         original: [B, T, C, H, W] original frames
         masked: [B, T, C, H, W] masked frames
         reconstructed: [B, T, C, H, W] reconstructed frames
         num_samples: Number of samples to include in grid
+        num_frames: Number of equally-spaced frames to select along T
 
     Returns:
         Grid image as numpy array [H, W, C]
     """
     B, T, C, H, W = original.shape
-
-    # Select first frame from sequence and first num_samples from batch
     num_samples = min(num_samples, B)
-    original = original[:num_samples, 0]  # [N, C, H, W]
-    masked = masked[:num_samples, 0]
-    reconstructed = reconstructed[:num_samples, 0]
+    num_frames = min(num_frames, T)
 
-    # Stack horizontally: original | masked | reconstructed
-    images = torch.cat([original, masked, reconstructed], dim=0)  # [N*3, C, H, W]
+    # Equally-spaced frame indices along T
+    frame_indices = torch.linspace(0, T - 1, num_frames).long()
 
-    # Clamp to valid range
-    images = torch.clamp(images, 0, 1)
-
-    # Convert to numpy and rearrange
-    images = images.cpu().numpy()
-    images = np.transpose(images, (0, 2, 3, 1))  # [N*3, H, W, C]
-
-    # Create grid: rows are samples, columns are [original, masked, reconstructed]
     rows = []
-    for i in range(num_samples):
-        row = np.concatenate([
-            images[i],                      # original
-            images[i + num_samples],        # masked
-            images[i + 2 * num_samples]     # reconstructed
-        ], axis=1)
-        rows.append(row)
+    for s in range(num_samples):
+        for t_idx in frame_indices:
+            t = t_idx.item()
+            orig_frame = torch.clamp(original[s, t], 0, 1).cpu().numpy()
+            mask_frame = torch.clamp(masked[s, t], 0, 1).cpu().numpy()
+            recon_frame = torch.clamp(reconstructed[s, t], 0, 1).float().cpu().numpy()
+
+            # [C, H, W] -> [H, W, C]
+            orig_frame = np.transpose(orig_frame, (1, 2, 0))
+            mask_frame = np.transpose(mask_frame, (1, 2, 0))
+            recon_frame = np.transpose(recon_frame, (1, 2, 0))
+
+            row = np.concatenate([orig_frame, mask_frame, recon_frame], axis=1)
+            rows.append(row)
 
     grid = np.concatenate(rows, axis=0)
-
     return grid
 
 
@@ -61,7 +61,8 @@ def log_reconstruction_comparison(
     masked_dict: dict,
     reconstructed_dict: dict,
     step: int,
-    num_samples: int = 4
+    num_samples: int = 4,
+    num_frames: int = 8,
 ):
     """
     Log reconstruction comparisons for multiple masking strategies to wandb.
@@ -73,6 +74,7 @@ def log_reconstruction_comparison(
         reconstructed_dict: Dictionary mapping strategy name to reconstructed frames
         step: Current training step
         num_samples: Number of samples per strategy
+        num_frames: Number of equally-spaced frames to visualize per sample
     """
     if not logger or not logger.enabled:
         return
@@ -84,7 +86,8 @@ def log_reconstruction_comparison(
             original,
             masked_dict[strategy],
             reconstructed_dict[strategy],
-            num_samples=num_samples
+            num_samples=num_samples,
+            num_frames=num_frames,
         )
 
         # Convert to wandb Image

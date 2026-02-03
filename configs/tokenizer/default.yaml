@@ -15,12 +15,12 @@ training:
   learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_steps: 1000
-  max_steps: 100000
+  max_steps: 10000
   grad_clip: 1.0
   batch_size: 4
   num_workers: 0
-  checkpoint_every: 10000
-  eval_every: 10000
+  checkpoint_every: 1000
+  eval_every: 1000
   log_every: 100
   save_dir: outputs
 

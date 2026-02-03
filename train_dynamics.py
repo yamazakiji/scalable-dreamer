@@ -20,14 +20,11 @@ from pathlib import Path
 from wm.configs.base import ExperimentConfig
 from wm.models.dynamics.dynamics_model import DynamicsModel
 from wm.models.dynamics.shortcut_forcing import ShortcutForcing
-from wm.models.dynamics.inference import denoise_frame
 from wm.data.latent_dataset import LatentDataset
 from wm.training.distributed import setup_distributed, cleanup_distributed, wrap_model_ddp
 from wm.training.optimizer import get_optimizer, get_warmup_scheduler
 from wm.utils.logging import WandbLogger
-from wm.utils.metrics import compute_latent_metrics
-from wm.utils.evaluation import prepare_eval_batch, aggregate_metrics, log_evaluation
-from wm.utils.io import save_frame_outputs, save_evaluation_summary
+from wm.utils.evaluation import evaluate_full, log_evaluation
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -85,165 +82,6 @@ def train_step(
         "bootstrap_loss": loss_dict["bootstrap"].item(),
         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
     }
-
-
-@torch.no_grad()
-def evaluate_detailed(
-    model: nn.Module,
-    eval_dataloader: DataLoader,
-    logger,
-    step: int,
-    device: torch.device,
-    output_dir: str = "outputs",
-    rank: int = 0,
-    num_inference_steps_list: list[int] | None = None,
-    num_frames_to_evaluate: int = 4,
-    save_outputs: bool = True,
-    use_fsdp: bool = False,
-):
-    """
-    Detailed evaluation with step-by-step denoising visibility.
-
-    Simulates real inference for multiple K values:
-    1. Take context frames
-    2. For each target frame, for each K in [4, 8, 30]:
-       - Start from same noise seed (for fair comparison)
-       - Run K denoising steps
-       - Track intermediate predictions at each step
-       - Compare to ground truth
-    3. Save all outputs and compute comparative metrics
-
-    Args:
-        model: DynamicsModel
-        eval_dataloader: DataLoader for evaluation data
-        logger: WandbLogger or None
-        step: Current training step
-        device: Device to run on
-        output_dir: Directory to save outputs
-        rank: Process rank for distributed training
-        num_inference_steps_list: List of K values to evaluate (default: [4, 8, 30])
-        num_frames_to_evaluate: Number of frames to generate per sequence
-        save_outputs: Whether to save outputs to disk
-        use_fsdp: Whether FSDP is being used
-    """
-    K_values = num_inference_steps_list or [4, 8, 30]
-
-    model.eval()
-
-    # 1. Prepare batch
-    batch_data = prepare_eval_batch(
-        eval_dataloader, device, context_len=4, max_gen_len=num_frames_to_evaluate
-    )
-    z_context = batch_data["z_context"]
-    z_target_all = batch_data["z_targets"]
-    actions = batch_data["actions"]
-    context_len = batch_data["context_len"]
-    gen_len = batch_data["gen_len"]
-    B, _, N, D = batch_data["batch_shape"]
-
-    # 2. Setup - add noise to context
-    context_noise = 0.1
-    noise = torch.randn_like(z_context)
-    z_context_noisy = (1 - context_noise) * z_context + context_noise * noise
-
-    # Create output directory
-    eval_output_dir = Path(output_dir) / f"eval_step_{step}"
-    if save_outputs and rank == 0:
-        eval_output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Store all metrics for logging
-    all_metrics = {}
-
-    # Generate frames autoregressively, comparing all K values
-    z_history_by_K = {K: z_context_noisy.clone() for K in K_values}
-
-    # Use a fixed seed for fair comparison across K values
-    base_seed = step * 1000
-
-    # 3. Generation loop
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        for t in range(gen_len):
-            frame_idx = context_len + t
-            action_t = actions[:, frame_idx:frame_idx + 1]  # (B, 1)
-            z_target = z_target_all[:, t:t + 1]  # (B, 1, N, D)
-
-            frame_results = {}
-
-            for K in K_values:
-                # Get current context for this K
-                z_ctx = z_history_by_K[K]
-                T_ctx = z_ctx.shape[1]
-
-                # Use same seed for all K values (fair comparison)
-                generator = torch.Generator(device=device)
-                generator.manual_seed(base_seed + t)
-
-                # Run denoising with K steps
-                intermediates = denoise_frame(
-                    model=model,
-                    z_context_noisy=z_ctx[:, -context_len:] if T_ctx > context_len else z_ctx,
-                    z_target_shape=(B, 1, N, D),
-                    action_t=action_t,
-                    K=K,
-                    context_noise=context_noise,
-                    device=device,
-                    generator=generator,
-                )
-
-                # Get final prediction
-                z_pred_final = intermediates[-1]["z_pred"].to(device)
-
-                # Compute metrics for final prediction
-                final_metrics = compute_latent_metrics(z_pred_final, z_target)
-
-                # Compute per-step metrics
-                step_metrics = []
-                for inter in intermediates:
-                    step_m = compute_latent_metrics(inter["z_pred"].to(device), z_target)
-                    step_metrics.append({
-                        "step": inter["step"],
-                        "tau": inter["tau"],
-                        "d": inter["d"],
-                        "mse": step_m["mse"],
-                        "cosine_sim": step_m["cosine_sim"],
-                    })
-
-                frame_results[K] = {
-                    "intermediates": intermediates,
-                    "final_metrics": final_metrics,
-                    "step_metrics": step_metrics,
-                }
-
-                # Update history for this K
-                z_history_by_K[K] = torch.cat([z_history_by_K[K], z_pred_final], dim=1)
-
-                # Log metrics for this K and frame
-                all_metrics[f"eval/K{K}_frame{t}_mse"] = final_metrics["mse"]
-                all_metrics[f"eval/K{K}_frame{t}_cosine_sim"] = final_metrics["cosine_sim"]
-
-                # Log step-wise progression for first frame
-                if t == 0:
-                    for sm in step_metrics:
-                        all_metrics[f"eval/K{K}_step{sm['step']}_mse"] = sm["mse"]
-
-            # Save outputs for this frame (only on rank 0)
-            if save_outputs and rank == 0:
-                batch_dir = eval_output_dir / "batch_0"
-                save_frame_outputs(batch_dir, t, z_target, frame_results, K_values)
-
-    # 4. Aggregate and log
-    all_metrics = aggregate_metrics(all_metrics, K_values, gen_len)
-
-    if save_outputs and rank == 0:
-        save_evaluation_summary(eval_output_dir, step, context_len, gen_len, K_values, all_metrics)
-
-    if rank == 0:
-        log_evaluation(
-            logger, all_metrics, step, K_values,
-            eval_output_dir if save_outputs else None, use_fsdp
-        )
-
-    model.train()
 
 
 def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_fsdp: bool = False):
@@ -415,19 +253,17 @@ def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_f
             if step > 0 and step % config.training.eval_every == 0:
                 if is_main:
                     print(f"\nRunning evaluation at step {step}...")
-                evaluate_detailed(
+                eval_metrics = evaluate_full(
                     model=model,
                     eval_dataloader=eval_dataloader,
-                    logger=logger,
-                    step=step,
                     device=device,
-                    output_dir=str(Path(config.training.save_dir) / config.name / "eval"),
-                    rank=rank,
-                    num_inference_steps_list=[4, 8, 30],
-                    num_frames_to_evaluate=4,
-                    save_outputs=is_main,
-                    use_fsdp=use_fsdp,
+                    context_len=4,
+                    num_gen_frames=8,
+                    K=4,
+                    context_noise=0.1,
                 )
+                if is_main:
+                    log_evaluation(logger, eval_metrics, step, use_fsdp=use_fsdp)
 
             if step > 0 and step % config.training.checkpoint_every == 0:
                 save_dir = Path(config.training.save_dir) / config.name

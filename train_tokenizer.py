@@ -76,31 +76,48 @@ def evaluate(
     rank: int = 0,
     use_fsdp: bool = False,
 ):
-    """Evaluation phase for CausalTokenizer."""
+    """Evaluation phase for CausalTokenizer.
+
+    Iterates over the full eval dataloader to compute mean metrics.
+    Uses the first batch for visualization.
+    """
     model.eval()
 
-    batch, _ = next(iter(eval_dataloader))
-    batch = batch.to(device)
+    metric_sums: dict[str, float] = {}
+    num_batches = 0
+    first_batch = None
+    first_recon_dict: dict[str, torch.Tensor] = {}
 
-    all_metrics = {}
-    reconstructed_dict = {}
+    for batch, _ in eval_dataloader:
+        batch = batch.to(device)
 
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        _, recon_masked, _, _ = model(batch, apply_masking=True)
-        metrics_masked = compute_reconstruction_metrics(
-            recon_masked, batch, lpips_model=lpips_model
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, recon_masked, _, _ = model(batch, apply_masking=True)
+            metrics_masked = compute_reconstruction_metrics(
+                recon_masked, batch, lpips_model=lpips_model
+            )
+
+            _, recon_clean, _, _ = model(batch, apply_masking=False)
+            metrics_clean = compute_reconstruction_metrics(
+                recon_clean, batch, lpips_model=lpips_model
+            )
+
         for k, v in metrics_masked.items():
-            all_metrics[f"eval/masked_{k}"] = v
-        reconstructed_dict["masked"] = recon_masked
-
-        _, recon_clean, _, _ = model(batch, apply_masking=False)
-        metrics_clean = compute_reconstruction_metrics(
-            recon_clean, batch, lpips_model=lpips_model
-        )
+            key = f"eval/masked_{k}"
+            metric_sums[key] = metric_sums.get(key, 0.0) + v
         for k, v in metrics_clean.items():
-            all_metrics[f"eval/inference_{k}"] = v
-        reconstructed_dict["inference"] = recon_clean
+            key = f"eval/inference_{k}"
+            metric_sums[key] = metric_sums.get(key, 0.0) + v
+
+        if first_batch is None:
+            first_batch = batch
+            first_recon_dict["masked"] = recon_masked
+            first_recon_dict["inference"] = recon_clean
+
+        num_batches += 1
+
+    # Compute mean metrics
+    all_metrics = {k: v / num_batches for k, v in metric_sums.items()}
 
     if rank == 0:
         if logger:
@@ -110,21 +127,24 @@ def evaluate(
                 all_metrics.update({f"memory/{k}": v for k, v in mem_stats.items()})
             logger.log(all_metrics, step=step)
 
-        num_samples = min(4, batch.shape[0])
-        original_dict = {
-            "masked": batch[:num_samples],
-            "inference": batch[:num_samples],
-        }
-        log_reconstruction_comparison(
-            logger,
-            batch[:num_samples],
-            original_dict,
-            {k: v[:num_samples] for k, v in reconstructed_dict.items()},
-            step=step,
-            num_samples=num_samples,
-        )
+        # Visualization from first batch
+        if first_batch is not None:
+            num_samples = min(1, first_batch.shape[0])
+            original_dict = {
+                "masked": first_batch[:num_samples],
+                "inference": first_batch[:num_samples],
+            }
+            log_reconstruction_comparison(
+                logger,
+                first_batch[:num_samples],
+                original_dict,
+                {k: v[:num_samples] for k, v in first_recon_dict.items()},
+                step=step,
+                num_samples=num_samples,
+                num_frames=8,
+            )
 
-        print(f"\nEvaluation at step {step}:")
+        print(f"\nEvaluation at step {step} ({num_batches} batches):")
         print(
             f"  masked: LPIPS={all_metrics.get('eval/masked_lpips', 0):.4f}, "
             f"MSE={all_metrics.get('eval/masked_mse', 0):.4f}"
@@ -194,7 +214,7 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         optimizer, config.training.warmup_steps, config.training.max_steps
     )
 
-    dataset = VideoDataset(video_dir="./data")
+    dataset = VideoDataset(video_dir="./data/rollouts")
     sampler = DistributedSampler(dataset, shuffle=True) if (world_size > 1 or use_fsdp) else None
 
     dataloader = DataLoader(
@@ -207,7 +227,7 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         drop_last=True,
     )
 
-    eval_dataset = VideoDataset(video_dir="./data")
+    eval_dataset = VideoDataset(video_dir="./data/rollouts_val")
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=config.training.batch_size,
