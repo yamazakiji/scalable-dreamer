@@ -1,13 +1,104 @@
 import argparse
 import json
+import signal
+import sys
 import cv2
 import numpy as np
 import stable_retro as retro
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 
 from wm.policies import RandomPolicy
+
+
+def worker_collect_episode(args: tuple) -> dict:
+    """Worker function for parallel episode collection.
+
+    Each worker creates its own env and policy instances since retro
+    environments are not thread-safe.
+
+    Args:
+        args: Tuple of (episode_idx, base_seed, output_dir, fps, max_steps,
+                       frame_height, frame_width, game_name)
+
+    Returns:
+        dict: Episode metadata
+    """
+    (episode_idx, base_seed, output_dir, fps, max_steps,
+     frame_height, frame_width, game_name) = args
+
+    episode_seed = base_seed + episode_idx
+    env = retro.make(game=game_name)
+    policy = RandomPolicy(env.action_space, seed=episode_seed)
+
+    try:
+        return collect_episode(env, policy, episode_idx, Path(output_dir),
+                               fps, max_steps, frame_height, frame_width)
+    finally:
+        env.close()
+
+
+def collect_episodes_parallel(
+    worker_args: list,
+    num_workers: int,
+    num_episodes: int
+) -> list:
+    """Collect episodes in parallel with progress tracking and graceful shutdown.
+
+    Args:
+        worker_args: List of argument tuples for worker_collect_episode
+        num_workers: Number of worker processes
+        num_episodes: Total number of episodes (for progress bar)
+
+    Returns:
+        list: Sorted list of episode metadata dictionaries
+    """
+    results = []
+    shutdown_requested = False
+    executor = None
+
+    def signal_handler(signum, frame):
+        nonlocal shutdown_requested
+        if not shutdown_requested:
+            shutdown_requested = True
+            print("\nShutdown requested, waiting for current episodes to complete...")
+        else:
+            print("\nForce shutdown...")
+            sys.exit(1)
+
+    original_sigint = signal.signal(signal.SIGINT, signal_handler)
+    original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        executor = ProcessPoolExecutor(max_workers=num_workers)
+        futures = {executor.submit(worker_collect_episode, args): args[0]
+                   for args in worker_args}
+
+        with tqdm(total=num_episodes, desc="Episodes") as pbar:
+            for future in as_completed(futures):
+                if shutdown_requested:
+                    break
+                try:
+                    metadata = future.result()
+                    results.append(metadata)
+                    pbar.update(1)
+                except Exception as e:
+                    episode_idx = futures[future]
+                    print(f"\nError in episode {episode_idx}: {e}")
+
+        if shutdown_requested:
+            executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    # Sort by episode_id for consistent ordering
+    results.sort(key=lambda x: x["episode_id"])
+    return results
 
 
 def collect_episode(
@@ -155,11 +246,19 @@ def main():
         default=320,
         help="Video frame width (default: 320)"
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers (default: 1)"
+    )
     args = parser.parse_args()
 
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    game_name = 'MortalKombatII-Genesis-v0'
 
     print("=" * 60)
     print("Mortal Kombat II Rollout Collection")
@@ -169,39 +268,54 @@ def main():
     print(f"Random seed: {args.seed}")
     print(f"Video settings: {args.frame_width}x{args.frame_height} @ {args.fps} fps")
     print(f"Max steps per episode: {args.max_steps}")
+    print(f"Number of workers: {args.num_workers}")
     print()
 
-    # Create environment
+    # Create environment to display info
     print("Creating environment...")
-    env = retro.make(game='MortalKombatII-Genesis-v0')
+    env = retro.make(game=game_name)
     print(f"Action space: {env.action_space}")
     print(f"Observation space: {env.observation_space}")
-    print()
-
-    # Create policy
-    print("Initializing random policy...")
-    policy = RandomPolicy(env.action_space, seed=args.seed)
+    env.close()
     print()
 
     # Collect episodes
     print("Collecting episodes...")
-    all_metadata = []
 
-    for episode_idx in tqdm(range(1, args.num_episodes + 1), desc="Episodes"):
-        metadata = collect_episode(
-            env=env,
-            policy=policy,
-            episode_idx=episode_idx,
-            output_dir=output_dir,
-            fps=args.fps,
-            max_steps=args.max_steps,
-            frame_height=args.frame_height,
-            frame_width=args.frame_width
+    if args.num_workers > 1:
+        # Parallel collection
+        worker_args = [
+            (episode_idx, args.seed, str(output_dir), args.fps, args.max_steps,
+             args.frame_height, args.frame_width, game_name)
+            for episode_idx in range(1, args.num_episodes + 1)
+        ]
+        all_metadata = collect_episodes_parallel(
+            worker_args, args.num_workers, args.num_episodes
         )
-        all_metadata.append(metadata)
+    else:
+        # Sequential collection (original behavior)
+        env = retro.make(game=game_name)
+        policy = RandomPolicy(env.action_space, seed=args.seed)
+        all_metadata = []
 
-    # Close environment
-    env.close()
+        for episode_idx in tqdm(range(1, args.num_episodes + 1), desc="Episodes"):
+            # Use deterministic seeding per episode for consistency with parallel mode
+            episode_seed = args.seed + episode_idx
+            policy = RandomPolicy(env.action_space, seed=episode_seed)
+
+            metadata = collect_episode(
+                env=env,
+                policy=policy,
+                episode_idx=episode_idx,
+                output_dir=output_dir,
+                fps=args.fps,
+                max_steps=args.max_steps,
+                frame_height=args.frame_height,
+                frame_width=args.frame_width
+            )
+            all_metadata.append(metadata)
+
+        env.close()
 
     # Save summary
     total_frames = sum(m["num_steps"] for m in all_metadata)
@@ -221,8 +335,9 @@ def main():
             "fps": args.fps,
             "max_steps": args.max_steps,
             "frame_size": [args.frame_height, args.frame_width],
-            "environment": "MortalKombatII-Genesis-v0",
-            "policy_type": "random"
+            "environment": game_name,
+            "policy_type": "random",
+            "num_workers": args.num_workers
         }
     }
 
