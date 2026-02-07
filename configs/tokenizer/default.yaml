@@ -7,21 +7,21 @@ tokenizer:
   in_channels: 3
   embed_dim: 512
   num_heads: 8
-  num_latents: 128
-  latent_dim: 64
+  num_latents: 64
+  latent_dim: 128
   gradient_checkpointing: true
 
 training:
   learning_rate: 1.0e-4
   weight_decay: 0.01
-  warmup_steps: 1000
-  max_steps: 10000
+  warmup_steps: 50
+  max_steps: 3000
   grad_clip: 1.0
   batch_size: 4
   num_workers: 0
   checkpoint_every: 1000
-  eval_every: 1000
-  log_every: 100
+  eval_every: 500
+  log_every: 10
   save_dir: outputs
 
 use_wandb: true

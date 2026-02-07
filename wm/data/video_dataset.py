@@ -111,6 +111,7 @@ class VideoDataset(Dataset):
                 frame_idx = 0
 
             # Resize frame (frame_size is (H, W), cv2 expects (W, H))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame = cv2.resize(frame, self.frame_size[::-1])
             frames.append(frame)
 

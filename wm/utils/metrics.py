@@ -36,7 +36,6 @@ class LPIPSMetric(nn.Module):
         self.model = lpips.LPIPS(net=net).to(device)
         self.model.eval()
 
-    @torch.no_grad()
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
         Compute LPIPS distance.

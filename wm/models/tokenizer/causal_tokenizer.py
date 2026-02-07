@@ -46,18 +46,25 @@ class CausalTokenizer(nn.Module):
         )
 
         # Mask token for masked patches in encoder
-        self.mask_token = nn.Parameter(torch.randn(1, 1, 1, embed_dim))
-
-        # Learnable latent tokens prepended to encoder input
-        self.latent_tokens = nn.Parameter(torch.randn(1, 1, num_latents, embed_dim))
-
-        # Decoder tokens for reading out patch reconstructions
-        self.decoder_tokens = nn.Parameter(torch.randn(1, 1, self.num_patches, embed_dim))
+        # Initialized with std=0.02 following ViT/MAE convention (He et al., 2022;
+        # Dosovitskiy et al., 2020). Default torch.randn gives std=1.0 which
+        # overwhelms patch embeddings (~std 0.5 from Kaiming init) in attention,
+        # causing the model to ignore image content for hundreds of steps.
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, embed_dim))
+        self.latent_tokens = nn.Parameter(torch.zeros(1, 1, num_latents, embed_dim))
+        self.decoder_tokens = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.latent_tokens, std=0.02)
+        nn.init.normal_(self.decoder_tokens, std=0.02)
 
         # Encoder: process patches + latent tokens
         self.encoder_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, "space") for _ in range(3)
         ])
+        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
+        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
         self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
 
         # Projection to bottleneck latent representation with tanh
@@ -73,6 +80,10 @@ class CausalTokenizer(nn.Module):
         self.decoder_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, "space") for _ in range(3)
         ])
+        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
+        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
         self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
 
         # Output projection for patch reconstruction

@@ -214,7 +214,7 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         optimizer, config.training.warmup_steps, config.training.max_steps
     )
 
-    dataset = VideoDataset(video_dir="./data/rollouts")
+    dataset = VideoDataset(video_dir="./data/rollouts_one_batch")
     sampler = DistributedSampler(dataset, shuffle=True) if (world_size > 1 or use_fsdp) else None
 
     dataloader = DataLoader(
@@ -227,7 +227,8 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         drop_last=True,
     )
 
-    eval_dataset = VideoDataset(video_dir="./data/rollouts_val")
+    # eval_dataset = VideoDataset(video_dir="./data/rollouts_val")
+    eval_dataset = VideoDataset(video_dir="./data/rollouts_one_batch")
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=config.training.batch_size,
