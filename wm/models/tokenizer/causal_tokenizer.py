@@ -46,10 +46,6 @@ class CausalTokenizer(nn.Module):
         )
 
         # Mask token for masked patches in encoder
-        # Initialized with std=0.02 following ViT/MAE convention (He et al., 2022;
-        # Dosovitskiy et al., 2020). Default torch.randn gives std=1.0 which
-        # overwhelms patch embeddings (~std 0.5 from Kaiming init) in attention,
-        # causing the model to ignore image content for hundreds of steps.
         self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, embed_dim))
         self.latent_tokens = nn.Parameter(torch.zeros(1, 1, num_latents, embed_dim))
         self.decoder_tokens = nn.Parameter(torch.zeros(1, 1, self.num_patches, embed_dim))
@@ -58,33 +54,33 @@ class CausalTokenizer(nn.Module):
         nn.init.normal_(self.decoder_tokens, std=0.02)
 
         # Encoder: process patches + latent tokens
-        self.encoder_blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, "space") for _ in range(3)
-        ])
-        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
-        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
-        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
-        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
-        self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
+        self.encoder_blocks = nn.ModuleList()
+        for _ in range(2):
+            self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+            self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+            self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+            self.encoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
 
         # Projection to bottleneck latent representation with tanh
         self.to_latent = nn.Sequential(
-            nn.Linear(embed_dim, latent_dim),
+            nn.Linear(embed_dim, latent_dim, bias=False),
+            nn.RMSNorm(latent_dim),
             nn.Tanh()
         )
+        # Small init keeps pre-tanh activations in the linear regime (~std 0.5),
+        # preventing saturation and vanishing gradients at the start of training
+        nn.init.normal_(self.to_latent[0].weight, std=0.5 / embed_dim ** 0.5)
 
         # Projection from bottleneck back to model dimension
         self.from_latent = nn.Linear(latent_dim, embed_dim)
 
         # Decoder: reconstruct patches from latents + decoder tokens
-        self.decoder_blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, "space") for _ in range(3)
-        ])
-        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
-        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
-        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
-        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
-        self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
+        self.decoder_blocks = nn.ModuleList()
+        for _ in range(2):
+            self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+            self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+            self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "space"))
+            self.decoder_blocks.append(TransformerBlock(embed_dim, num_heads, "time"))
 
         # Output projection for patch reconstruction
         self.to_pixels = nn.Sequential(

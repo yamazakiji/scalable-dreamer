@@ -34,7 +34,7 @@ class LPIPSMetric(nn.Module):
             )
 
         self.model = lpips.LPIPS(net=net).to(device)
-        self.model.eval()
+        # self.model.eval()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """

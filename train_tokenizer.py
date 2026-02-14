@@ -29,12 +29,53 @@ except ImportError:
     FSDP_AVAILABLE = False
 
 
+class RunningRMSNormalizer:
+    """Normalizes losses by their running RMS estimate (EMA of squared values).
+
+    Each loss component is divided by its RMS estimate so that differently-scaled
+    losses contribute roughly equally to the combined gradient.
+    """
+
+    def __init__(self, decay: float = 0.99):
+        self.decay = decay
+        self.ema_sq: dict[str, float] = {}
+        self.steps: dict[str, int] = {}
+
+    def __call__(self, loss: torch.Tensor, name: str) -> torch.Tensor:
+        val = loss.detach().float().item()
+
+        if name not in self.ema_sq:
+            # First call — seed the estimate, return raw loss
+            self.ema_sq[name] = val ** 2
+            self.steps[name] = 1
+            return loss
+
+        self.steps[name] += 1
+        self.ema_sq[name] = self.decay * self.ema_sq[name] + (1 - self.decay) * val ** 2
+
+        # Bias-corrected RMS estimate
+        bias_correction = 1 - self.decay ** self.steps[name]
+        rms = (self.ema_sq[name] / bias_correction) ** 0.5
+
+        return loss / max(rms, 1e-8)
+
+    def get_rms_estimates(self) -> dict[str, float]:
+        """Return current bias-corrected RMS estimates for logging."""
+        out = {}
+        for name in self.ema_sq:
+            bias_correction = 1 - self.decay ** self.steps[name]
+            out[name] = (self.ema_sq[name] / bias_correction) ** 0.5
+        return out
+
+
 def train_step(
     model: nn.Module,
     batch: torch.Tensor,
     optimizer: torch.optim.Optimizer,
     lpips_model: LPIPSMetric,
+    rms_normalizer: RunningRMSNormalizer,
     grad_clip: float = 1.0,
+    compute_diagnostics: bool = False,
 ) -> dict:
     """Single training step."""
     optimizer.zero_grad()
@@ -42,27 +83,40 @@ def train_step(
     B, T, C, H, W = batch.shape
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        _, recon, _, _ = model(batch, apply_masking=True)
+        z, recon, _, _ = model(batch, apply_masking=True)
 
         pred_flat = recon.view(B * T, C, H, W)
         target_flat = batch.view(B * T, C, H, W)
 
         mse_loss = nn.functional.mse_loss(recon, batch)
         lpips_loss = lpips_model(pred_flat, target_flat)
-        loss = mse_loss + 0.2 * lpips_loss
+        loss = rms_normalizer(mse_loss, "mse") + 0.2 * rms_normalizer(lpips_loss, "lpips")
 
-    loss.backward()
-
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-    optimizer.step()
-
-    return {
+    metrics = {
         "loss": loss.item(),
         "mse_loss": mse_loss.item(),
         "lpips_loss": lpips_loss.item(),
-        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
     }
+
+    if compute_diagnostics:
+        # Latent stats
+        z_abs = z.detach().float().abs()
+        metrics["latent/mean_abs_z"] = z_abs.mean().item()
+        metrics["latent/frac_saturated"] = (z_abs > 0.99).float().mean().item()
+        metrics["latent/std_z"] = z.detach().float().std().item()
+        # Loss RMS estimates
+        for name, rms in rms_normalizer.get_rms_estimates().items():
+            metrics[f"loss_rms/{name}"] = rms
+        loss.backward()
+    else:
+        loss.backward()
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    metrics["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+
+    optimizer.step()
+
+    return metrics
 
 
 @torch.no_grad()
@@ -214,7 +268,7 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         optimizer, config.training.warmup_steps, config.training.max_steps
     )
 
-    dataset = VideoDataset(video_dir="./data/rollouts_one_batch")
+    dataset = VideoDataset(video_dir="./data/rollouts")
     sampler = DistributedSampler(dataset, shuffle=True) if (world_size > 1 or use_fsdp) else None
 
     dataloader = DataLoader(
@@ -227,8 +281,8 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         drop_last=True,
     )
 
-    # eval_dataset = VideoDataset(video_dir="./data/rollouts_val")
-    eval_dataset = VideoDataset(video_dir="./data/rollouts_one_batch")
+    eval_dataset = VideoDataset(video_dir="./data/rollouts_val")
+    # eval_dataset = VideoDataset(video_dir="./data/rollouts_one_batch")
     eval_dataloader = DataLoader(
         eval_dataset,
         batch_size=config.training.batch_size,
@@ -269,6 +323,8 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
             start_step = checkpoint["step"]
             start_epoch = checkpoint["epoch"]
 
+    rms_normalizer = RunningRMSNormalizer()
+
     model.train()
     step = start_step
     epoch = start_epoch
@@ -283,20 +339,30 @@ def train(config: ExperimentConfig, use_fsdp: bool = False):
         for batch, _ in dataloader:
             batch = batch.to(device)
 
+            is_log_step = is_main and step % config.training.log_every == 0
             metrics = train_step(
-                model, batch, optimizer, lpips_model, config.training.grad_clip
+                model, batch, optimizer, lpips_model, rms_normalizer,
+                config.training.grad_clip, compute_diagnostics=is_log_step,
             )
             scheduler.step()
 
-            if is_main and step % config.training.log_every == 0:
+            if is_log_step:
                 metrics["lr"] = scheduler.get_last_lr()[0]
                 metrics["step"] = step
                 metrics["epoch"] = epoch
+
+                sat_info = ""
+                if "latent/frac_saturated" in metrics:
+                    sat_info = (
+                        f" | Sat: {metrics['latent/frac_saturated']:.3f}"
+                        f" | |z|: {metrics['latent/mean_abs_z']:.3f}"
+                    )
 
                 print(
                     f"Step {step}/{config.training.max_steps} | "
                     f"Loss: {metrics['loss']:.4f} | "
                     f"LR: {metrics['lr']:.2e}"
+                    f"{sat_info}"
                 )
 
                 if logger:
