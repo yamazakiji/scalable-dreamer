@@ -6,3 +6,7 @@ __pycache__/
 **/**/__pycache__/
 
 .vscode/
+data/
+wandb
+outputs/
+test_outputs/
