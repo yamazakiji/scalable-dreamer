@@ -71,19 +71,19 @@ def parse_args():
     parser.add_argument(
         "--num-frames",
         type=int,
-        default=100,
+        default=384,
         help="Total frames to process (default: 100)",
     )
     parser.add_argument(
         "--midpoint",
         type=int,
-        default=50,
+        default=150,
         help="Frame to switch to autoregressive (default: 50)",
     )
     parser.add_argument(
         "--fps",
         type=int,
-        default=10,
+        default=18,
         help="GIF frame rate (default: 10)",
     )
     parser.add_argument(
@@ -104,7 +104,7 @@ def get_device(device_arg: str) -> str:
 
 def load_tokenizer(checkpoint_path: str, device: str) -> CausalTokenizer:
     """Load CausalTokenizer from checkpoint."""
-    model = CausalTokenizer(img_size=128, latent_dim=64).to(device)
+    model = CausalTokenizer(img_size=128, num_latents=64, latent_dim=128).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint["model_state_dict"]
@@ -122,8 +122,8 @@ def load_dynamics_model(checkpoint_path: str, device: str) -> DynamicsModel:
         num_heads=8,
         num_layers=24,
         temporal_layer_freq=4,
-        num_spatial_tokens=128,  # Matches tokenizer
-        latent_dim=64,  # dont forget to change back
+        num_spatial_tokens=256,  # Matches tokenizer
+        latent_dim=128,  # dont forget to change back
         num_register_tokens=8,
         num_actions=12,
         num_action_tokens=1,

@@ -28,6 +28,46 @@ from wm.utils.evaluation import evaluate_full, log_evaluation
 
 torch.autograd.set_detect_anomaly(True)
 
+
+class RunningRMSNormalizer:
+    """Normalizes losses by their running RMS estimate (EMA of squared values).
+
+    Each loss component is divided by its RMS estimate so that differently-scaled
+    losses contribute roughly equally to the combined gradient.
+    """
+
+    def __init__(self, decay: float = 0.99):
+        self.decay = decay
+        self.ema_sq: dict[str, float] = {}
+        self.steps: dict[str, int] = {}
+
+    def __call__(self, loss: torch.Tensor, name: str) -> torch.Tensor:
+        val = loss.detach().float().item()
+
+        if name not in self.ema_sq:
+            # First call — seed the estimate, return raw loss
+            self.ema_sq[name] = val ** 2
+            self.steps[name] = 1
+            return loss
+
+        self.steps[name] += 1
+        self.ema_sq[name] = self.decay * self.ema_sq[name] + (1 - self.decay) * val ** 2
+
+        # Bias-corrected RMS estimate
+        bias_correction = 1 - self.decay ** self.steps[name]
+        rms = (self.ema_sq[name] / bias_correction) ** 0.5
+
+        return loss / max(rms, 1e-8)
+
+    def get_rms_estimates(self) -> dict[str, float]:
+        """Return current bias-corrected RMS estimates for logging."""
+        out = {}
+        for name in self.ema_sq:
+            bias_correction = 1 - self.decay ** self.steps[name]
+            out[name] = (self.ema_sq[name] / bias_correction) ** 0.5
+        return out
+
+
 # FSDP imports (optional, only used when --fsdp is enabled)
 try:
     from wm.training.fsdp import (
@@ -46,7 +86,9 @@ def train_step(
     objective: ShortcutForcing,
     batch: dict,
     optimizer: torch.optim.Optimizer,
+    rms_normalizer: RunningRMSNormalizer,
     grad_clip: float = 1.0,
+    compute_diagnostics: bool = False,
 ) -> dict:
     """Single training step with shortcut forcing.
 
@@ -55,7 +97,9 @@ def train_step(
         objective: ShortcutForcing loss function
         batch: Dict with "z", "a", "z_next" from LatentSequenceDataset
         optimizer: Optimizer
+        rms_normalizer: Running RMS normalizer for loss balancing
         grad_clip: Gradient clipping value
+        compute_diagnostics: Whether to compute extra diagnostics
 
     Returns:
         Dictionary of metrics
@@ -70,18 +114,25 @@ def train_step(
         # ShortcutForcing.compute_loss handles tau/d sampling and corruption internally
         loss_dict = objective.compute_loss(model, z_clean, actions)
 
-    loss_dict["total"].backward()
+    loss = rms_normalizer(loss_dict["flow"], "flow") + rms_normalizer(loss_dict["bootstrap"], "bootstrap")
+    loss.backward()
 
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
     optimizer.step()
 
-    return {
-        "loss": loss_dict["total"].item(),
+    metrics = {
+        "loss": loss.item(),
         "flow_loss": loss_dict["flow"].item(),
         "bootstrap_loss": loss_dict["bootstrap"].item(),
         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
     }
+
+    if compute_diagnostics:
+        for name, rms in rms_normalizer.get_rms_estimates().items():
+            metrics[f"loss_rms/{name}"] = rms
+
+    return metrics
 
 
 def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_fsdp: bool = False):
@@ -215,6 +266,8 @@ def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_f
             start_step = checkpoint["step"]
             start_epoch = checkpoint["epoch"]
 
+    rms_normalizer = RunningRMSNormalizer()
+
     model.train()
     step = start_step
     epoch = start_epoch
@@ -229,15 +282,24 @@ def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_f
         for batch in dataloader:
             batch = {k: v.to(device) for k, v in batch.items()}
 
+            is_log_step = is_main and step % config.training.log_every == 0
             metrics = train_step(
-                model, objective, batch, optimizer, config.training.grad_clip
+                model, objective, batch, optimizer, rms_normalizer,
+                config.training.grad_clip, compute_diagnostics=is_log_step,
             )
             scheduler.step()
 
-            if is_main and step % config.training.log_every == 0:
+            if is_log_step:
                 metrics["lr"] = scheduler.get_last_lr()[0]
                 metrics["step"] = step
                 metrics["epoch"] = epoch
+
+                rms_info = ""
+                rms_estimates = rms_normalizer.get_rms_estimates()
+                if rms_estimates:
+                    rms_info = " | RMS: " + ", ".join(
+                        f"{k}={v:.4f}" for k, v in rms_estimates.items()
+                    )
 
                 print(
                     f"Step {step}/{config.training.max_steps} | "
@@ -245,6 +307,7 @@ def train(config: ExperimentConfig, latent_dir: str, sequence_length: int, use_f
                     f"Flow: {metrics['flow_loss']:.4f} | "
                     f"Bootstrap: {metrics['bootstrap_loss']:.4f} | "
                     f"LR: {metrics['lr']:.2e}"
+                    f"{rms_info}"
                 )
 
                 if logger:
@@ -321,7 +384,7 @@ def main():
     )
 
     # Data arguments
-    parser.add_argument("--latent-dir", type=str, default="./data/latents",
+    parser.add_argument("--latent-dir", type=str, default="./data/latents_full",
                         help="Directory containing extracted latents")
     parser.add_argument("--sequence-length", type=int, default=128,
                         help="Sequence length for training")

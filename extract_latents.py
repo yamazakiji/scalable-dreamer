@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
+from wm.configs.base import ExperimentConfig, TokenizerConfig
 from wm.models.tokenizer.causal_tokenizer import CausalTokenizer
 from wm.data.video_dataset import VideoDataset
 from wm.training.distributed import setup_distributed, cleanup_distributed
@@ -36,8 +37,12 @@ except ImportError:
     FSDP_AVAILABLE = False
 
 
-def load_checkpoint(checkpoint_path: str, device: torch.device) -> dict:
-    """Load checkpoint and strip DDP 'module.' prefix if present."""
+def load_checkpoint(checkpoint_path: str, device: torch.device) -> tuple[OrderedDict, TokenizerConfig]:
+    """Load checkpoint and strip DDP 'module.' prefix if present.
+
+    Returns:
+        (state_dict, tokenizer_config) tuple
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint["model_state_dict"]
 
@@ -46,7 +51,15 @@ def load_checkpoint(checkpoint_path: str, device: torch.device) -> dict:
         k = k.replace("module.", "")
         new_state_dict[k] = v
 
-    return new_state_dict
+    # Load tokenizer config from checkpoint
+    if "config" in checkpoint:
+        config = ExperimentConfig.from_dict(checkpoint["config"])
+        tokenizer_config = config.tokenizer
+    else:
+        print("Warning: No config found in checkpoint, using defaults")
+        tokenizer_config = TokenizerConfig()
+
+    return new_state_dict, tokenizer_config
 
 
 def create_transitions(
@@ -203,16 +216,31 @@ def main():
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create model and load checkpoint
-    model = CausalTokenizer(img_size=128, latent_dim=64).to(device)
+    # Load checkpoint and config
+    if is_main:
+        print("Loading checkpoint...")
+    state_dict, tokenizer_config = load_checkpoint(args.checkpoint, device)
+
+    if is_main:
+        print(f"Tokenizer config: img_size={tokenizer_config.image_size}, "
+              f"num_latents={tokenizer_config.num_latents}, "
+              f"latent_dim={tokenizer_config.latent_dim}")
+
+    # Create model from config
+    model = CausalTokenizer(
+        img_size=tokenizer_config.image_size,
+        patch_size=tokenizer_config.patch_size,
+        in_channels=tokenizer_config.in_channels,
+        embed_dim=tokenizer_config.embed_dim,
+        num_heads=tokenizer_config.num_heads,
+        num_latents=tokenizer_config.num_latents,
+        latent_dim=tokenizer_config.latent_dim,
+    ).to(device)
 
     if is_main:
         num_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {num_params:,} ({num_params/1e6:.1f}M)")
 
-    if is_main:
-        print("Loading checkpoint...")
-    state_dict = load_checkpoint(args.checkpoint, device)
     model.load_state_dict(state_dict)
 
     # Apply FSDP if requested

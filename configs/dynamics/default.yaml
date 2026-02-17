@@ -7,7 +7,7 @@ dynamics:
   num_layers: 24
   temporal_layer_freq: 4
   num_spatial_tokens: 256
-  latent_dim: 64
+  latent_dim: 128
   num_register_tokens: 8
   num_actions: 12
   num_action_tokens: 1
@@ -18,13 +18,13 @@ dynamics:
 training:
   learning_rate: 1.0e-4
   weight_decay: 0.01
-  warmup_steps: 1000
-  max_steps: 100000
+  warmup_steps: 3000
+  max_steps: 20000
   grad_clip: 1.0
   batch_size: 1
-  checkpoint_every: 100
-  eval_every: 20
-  log_every: 10
+  checkpoint_every: 1000
+  eval_every: 20000
+  log_every: 100
   save_dir: outputs
 
 use_wandb: true
