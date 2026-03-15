@@ -10,3 +10,8 @@ data/
 wandb
 outputs/
 test_outputs/
+
+# CUDA kernel build cache
+build/
+*.so
+*.egg-info/

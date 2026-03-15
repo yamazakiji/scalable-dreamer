@@ -76,6 +76,7 @@ Following the paper:
 
 ### TODO
 
+- [ ] Clean this whole repo
 - [ ] Train decent dynamics model
 - [ ] Agent model (policy/reward/value heads)
 - [ ] Agent finetuning phase
